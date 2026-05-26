@@ -168,23 +168,12 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
 
   const leaveMap=buildLeaveMap(staff);
 
-  // Period targets — contracted hours is already per fortnight (2 weeks)
-  // For a 4-week roster, double it. weeks=2 → multiplier=1. weeks=4 → multiplier=2.
-  const multiplier = weeks / 2;
+  // Period targets
   const periodTarget={};
-  const maxShifts={}; // hard ceiling on number of shifts to prevent runaway assignment
   staff.forEach(s=>{
-    const raw = s.hrs * multiplier;
-    periodTarget[s.id] = s.permNights ? Math.floor(raw/10)*10 : raw;
-    // Max shifts = target hours / shift length, rounded up + 1 buffer
-    maxShifts[s.id] = s.permNights
-      ? Math.floor(periodTarget[s.id]/10)
-      : Math.round(periodTarget[s.id]/8);
+    const raw=s.hrs*(weeks/2);
+    periodTarget[s.id]=s.permNights?Math.floor(raw/10)*10:raw;
   });
-
-  // Shift count tracker — incremented every time a shift is assigned
-  const shiftCount={};
-  staff.forEach(s=>{ shiftCount[s.id]=0; });
 
   // Hours worked — pre-load leave hours
   const hw={};
@@ -234,8 +223,6 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     if(s.permNights&&shift!=="N")return false;
     if(!s.permNights&&shift==="N"&&!nightPlanData?.plan?.[s.id]?.[iso])return false;
     if(!fwaAllows(s,iso,shift))return false;
-    // Hard shift count ceiling — never exceed max shifts for this period
-    if(shiftCount[s.id]>=maxShifts[s.id])return false;
     const maxW=s.fwaConditions?.find(c=>c.type==="MAX_HOURS_WEEK")?.value;
     if(maxW&&weekHrs(s.id,iso,shift==="N"?10:8)>maxW)return false;
     if(s.cls==="GNP"&&s.gnpStart&&shift==="N"&&new Date(iso)<addDays(new Date(s.gnpStart),91))return false;
@@ -294,12 +281,12 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
         anumCnt++;
       }
       if(s.cls==="EN")enCnt++; if(s.cls==="GNP")gnpCnt++;
-      roster[iso].N.push(s.id); hw[s.id]+=10; shiftCount[s.id]++;
+      roster[iso].N.push(s.id); hw[s.id]+=10;
       if(isInCharge(s))icOk=true;
     }
     if(!icOk&&roster[iso].N.length>0){
       const ic=eligible.find(s=>!roster[iso].N.includes(s.id)&&isInCharge(s));
-      if(ic){roster[iso].N.push(ic.id);hw[ic.id]+=10;shiftCount[ic.id]++;}
+      if(ic){roster[iso].N.push(ic.id);hw[ic.id]+=10;}
     }
   });
 
@@ -322,19 +309,12 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   // Phase 2: Day & Evening
   days.forEach(({iso,di,wknd})=>{
     const BASE=wknd?9:10;
-    // Hard overstaffing cap for weekdays: never more than BASE+4 on any single shift
-    const OVERSTAFF_CAP=BASE+4;
-
     for(const shift of ["D","E"]){
       const isNUMSlot=shift==="D"&&di>=1&&di<=3&&!numHasWorked;
       const eligible=staff.filter(s=>{
         if(!canWork(s,iso,shift))return false;
         if(s.permNights)return false;
         if(nightPlanData?.plan?.[s.id]?.[iso])return false;
-        // Hard hours cap — never roster someone who has already met their target
-        // UNLESS we are below base staffing level (must fill the shift first)
-        const rem=periodTarget[s.id]-hw[s.id];
-        if(rem<=0&&roster[iso][shift].length>=BASE)return false;
         return true;
       }).sort((a,b)=>{
         const aReq=!!(a.requests?.[`${iso}_${shift}`]),bReq=!!(b.requests?.[`${iso}_${shift}`]);
@@ -342,20 +322,14 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
         if(wknd){const dw=(wkndCnt[a.id]||0)-(wkndCnt[b.id]||0);if(dw!==0)return dw;}
         const rA=rotScore(a.id,iso,shift),rB=rotScore(b.id,iso,shift);
         if(rA!==rB)return rA-rB;
-        // Sort by most hours remaining first (fills those with bigger deficits first)
         return (periodTarget[b.id]-hw[b.id])-(periodTarget[a.id]-hw[a.id]);
       });
-
       let anumCnt=0,enCnt=0,gnpCnt=0,numOn=false,icOk=false;
       for(const s of eligible){
         const rem=periodTarget[s.id]-hw[s.id];
-        // Weekend: hard cap at BASE, no overstaffing ever
         if(wknd&&roster[iso][shift].length>=BASE)break;
-        // Weekday: stop at OVERSTAFF_CAP regardless
-        if(roster[iso][shift].length>=OVERSTAFF_CAP)break;
-        // Weekday: once at BASE, only add staff who still need hours
         if(!wknd&&roster[iso][shift].length>=BASE&&rem<=0)continue;
-
+        if(rem<=0&&roster[iso][shift].length>=BASE)continue;
         if(s.cls==="NUM"){if(!isNUMSlot||numHasWorked)continue;numOn=true;}
         if(s.cls==="ANUM"){
           if(anumCnt>=1)continue;
@@ -365,24 +339,14 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
         if(s.cls==="EN"&&enCnt>=1)continue;
         if(s.cls==="GNP"){if(gnpCnt>=maxGNPShift)continue;gnpCnt++;}
         if(s.cls==="EN")enCnt++;
-
-        roster[iso][shift].push(s.id); hw[s.id]+=8; shiftCount[s.id]++;
+        roster[iso][shift].push(s.id); hw[s.id]+=8;
         if(wknd)wkndCnt[s.id]=(wkndCnt[s.id]||0)+1;
         if(isInCharge(s))icOk=true;
         if(s.cls==="NUM")numHasWorked=true;
       }
-
-      // Guarantee in-charge — but only add if they still have hours remaining
       if(!icOk&&roster[iso][shift].length>0){
-        const ic=eligible.find(s=>
-          !roster[iso][shift].includes(s.id)&&
-          isInCharge(s)&&
-          !s.permNights&&
-          !nightPlanData?.plan?.[s.id]?.[iso]&&
-          (periodTarget[s.id]-hw[s.id])>0&&
-          roster[iso][shift].length<OVERSTAFF_CAP
-        );
-        if(ic){roster[iso][shift].push(ic.id);hw[ic.id]+=8;shiftCount[ic.id]++;if(wknd)wkndCnt[ic.id]=(wkndCnt[ic.id]||0)+1;}
+        const ic=eligible.find(s=>!roster[iso][shift].includes(s.id)&&isInCharge(s)&&!s.permNights&&!nightPlanData?.plan?.[s.id]?.[iso]&&(periodTarget[s.id]-hw[s.id])>0);
+        if(ic){roster[iso][shift].push(ic.id);hw[ic.id]+=8;if(wknd)wkndCnt[ic.id]=(wkndCnt[ic.id]||0)+1;}
       }
     }
   });
@@ -396,16 +360,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
 
   // Hours summary
   const hoursSummary={};
-  staff.forEach(s=>{
-    hoursSummary[s.id]={
-      target:periodTarget[s.id],
-      worked:hw[s.id],
-      adoCount:adoTaken[s.id],
-      variance:hw[s.id]-periodTarget[s.id],
-      shifts:shiftCount[s.id],
-      maxShifts:maxShifts[s.id],
-    };
-  });
+  staff.forEach(s=>{ hoursSummary[s.id]={target:periodTarget[s.id],worked:hw[s.id],adoCount:adoTaken[s.id],variance:hw[s.id]-periodTarget[s.id]}; });
 
   // Warnings
   const warnings=[];
@@ -710,14 +665,14 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
             <table style={{borderCollapse:"collapse",width:"100%"}}>
               <thead>
                 <tr style={{background:"#060e18"}}>
-                  {["Staff","Class","Contract","Target","Worked","Variance","Shifts","ADOs"].map(h=>(
+                  {["Staff","Class","Contract","Target","Worked","Variance","ADOs"].map(h=>(
                     <th key={h} style={{...C.th,textAlign:"left",padding:"8px 12px",fontSize:11}}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {staff.filter(s=>!s.resigned).map((s,i)=>{
-                  const hs=roster.hoursSummary?.[s.id]||{target:s.hrs,worked:0,variance:0,adoCount:0,shifts:0,maxShifts:0};
+                  const hs=roster.hoursSummary?.[s.id]||{target:s.hrs,worked:0,variance:0,adoCount:0};
                   const cls=CLASSIFICATIONS[s.cls];
                   const ok=Math.abs(hs.variance)<=8,warn=Math.abs(hs.variance)<=16;
                   const col=ok?"#66bb6a":warn?"#ffa726":"#ef5350";
@@ -732,7 +687,6 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                         <span style={{color:col,fontWeight:700}}>{hs.variance>0?"+":""}{hs.variance}h</span>
                         {!ok&&<span style={{fontSize:9,marginLeft:4}}>{warn?"⚠":"✗"}</span>}
                       </td>
-                      <td style={{...C.td,padding:"8px 12px",color:"#7fb3d3"}}>{hs.shifts}/{hs.maxShifts}</td>
                       <td style={{...C.td,padding:"8px 12px",color:"#a5d6a7"}}>{hs.adoCount>0?`${hs.adoCount} ADO${hs.adoCount>1?"s":""}`:""}</td>
                     </tr>
                   );
