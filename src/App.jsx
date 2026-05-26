@@ -52,12 +52,32 @@ const fmtDate  = d => new Date(d).toLocaleDateString("en-AU",{day:"2-digit",mont
 const fmtShort = d => { const dt=new Date(d); return `${dt.getDate()} ${MONTH_NAMES[dt.getMonth()]}`; };
 const dayIdx   = d => { const w=new Date(d).getDay(); return w===0?6:w-1; };
 const isWknd   = d => dayIdx(d)>=5;
-const getMon   = d => { const x=new Date(d),di=x.getDay(); x.setDate(x.getDate()+(di===0?-6:1-di)); x.setHours(0,0,0,0); return x; };
+// getMon: always returns the Monday of the week containing date d.
+// Uses local date arithmetic to avoid UTC/timezone shift bugs.
+const getMon = d => {
+  const x = new Date(d);
+  // Reset to midnight in local time first
+  x.setHours(0, 0, 0, 0);
+  // getDay(): 0=Sun,1=Mon,...,6=Sat
+  const dow = x.getDay();
+  // Days to subtract to reach Monday: Sun→-6, Mon→0, Tue→-1, ... Sat→-5
+  const diff = dow === 0 ? -6 : 1 - dow;
+  x.setDate(x.getDate() + diff);
+  return x;
+};
 
-function buildDays(startMon,weeks) {
-  return Array.from({length:weeks*7},(_,i)=>{
-    const date=addDays(startMon,i);
-    return { date, iso:isoDate(date), di:dayIdx(date), wknd:isWknd(date), wk:Math.floor(i/7) };
+// buildDays: always produces exactly weeks*7 days starting from startMon.
+function buildDays(startMon, weeks) {
+  const total = weeks * 7; // 2 weeks = 14, 4 weeks = 28
+  return Array.from({length: total}, (_, i) => {
+    const date = addDays(startMon, i);
+    return {
+      date,
+      iso:  isoDate(date),
+      di:   dayIdx(date),
+      wknd: isWknd(date),
+      wk:   Math.floor(i / 7),
+    };
   });
 }
 
@@ -168,22 +188,43 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
 
   const leaveMap=buildLeaveMap(staff);
 
-  // Period targets
-  const periodTarget={};
-  staff.forEach(s=>{
-    const raw=s.hrs*(weeks/2);
-    periodTarget[s.id]=s.permNights?Math.floor(raw/10)*10:raw;
+  // Period targets — contracted hours is already per fortnight (2 weeks)
+  // For a 4-week roster, double it. weeks=2 → multiplier=1. weeks=4 → multiplier=2.
+  const multiplier = weeks / 2;
+  const periodTarget = {};
+  const maxShifts = {};
+  staff.forEach(s => {
+    const raw = s.hrs * multiplier;
+    periodTarget[s.id] = s.permNights ? Math.floor(raw / 10) * 10 : raw;
   });
 
-  // Hours worked — pre-load leave hours
-  const hw={};
-  staff.forEach(s=>{ hw[s.id]=0; });
-  staff.forEach(s=>{
-    days.forEach(d=>{
-      const lc=leaveMap[s.id][d.iso]; if(!lc||!SHIFT_DEF[lc])return;
-      hw[s.id]+=(s.permNights||nightPlanData?.plan?.[s.id]?.[d.iso])?10:8;
+  // Hours worked — pre-load leave hours FIRST so maxShifts accounts for them
+  const hw = {};
+  staff.forEach(s => { hw[s.id] = 0; });
+  staff.forEach(s => {
+    days.forEach(d => {
+      const lc = leaveMap[s.id][d.iso];
+      if (!lc || !SHIFT_DEF[lc]) return;
+      hw[s.id] += (s.permNights || nightPlanData?.plan?.[s.id]?.[d.iso]) ? 10 : 8;
     });
   });
+
+  // maxShifts: how many actual rostered shifts this person can still work
+  // = (target - hours already consumed by leave) / shift length, floored
+  // This is a HARD ceiling — canWork() refuses once reached.
+  staff.forEach(s => {
+    const remainingHrs = Math.max(0, periodTarget[s.id] - hw[s.id]);
+    if (s.permNights) {
+      maxShifts[s.id] = Math.floor(remainingHrs / 10);
+    } else {
+      // Use floor so we never exceed contracted hours
+      maxShifts[s.id] = Math.floor(remainingHrs / 8);
+    }
+  });
+
+  // Shift count tracker — incremented every time a shift is assigned
+  const shiftCount = {};
+  staff.forEach(s => { shiftCount[s.id] = 0; });
 
   // ADO tracking
   const adoAccrued={},adoTaken={},adoMap={};
@@ -214,22 +255,28 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     return tot;
   }
 
-  function canWork(s,iso,shift){
-    if(!s||s.resigned)return false;
-    if(s.resign&&new Date(iso)>=new Date(s.resign))return false;
-    if(leaveMap[s.id][iso])return false;
-    if(adoMap[s.id][iso])return false;
-    if(assignedToday(s.id,iso))return false;
-    if(s.permNights&&shift!=="N")return false;
-    if(!s.permNights&&shift==="N"&&!nightPlanData?.plan?.[s.id]?.[iso])return false;
-    if(!fwaAllows(s,iso,shift))return false;
-    const maxW=s.fwaConditions?.find(c=>c.type==="MAX_HOURS_WEEK")?.value;
-    if(maxW&&weekHrs(s.id,iso,shift==="N"?10:8)>maxW)return false;
-    if(s.cls==="GNP"&&s.gnpStart&&shift==="N"&&new Date(iso)<addDays(new Date(s.gnpStart),91))return false;
-    if(shift==="N"&&consecNights(s.id,iso)>=4)return false;
-    if(shift!=="N"&&consecShifts(s.id,iso)>=5)return false;
-    if((shift==="D"||shift==="E")&&nightWithin47h(s.id,iso))return false;
-    if(shift==="E"&&onShift(s.id,isoDate(addDays(new Date(iso),-1)),"N"))return false;
+  function canWork(s, iso, shift) {
+    if (!s || s.resigned) return false;
+    if (s.resign && new Date(iso) >= new Date(s.resign)) return false;
+    if (leaveMap[s.id][iso]) return false;
+    if (adoMap[s.id][iso]) return false;
+    if (assignedToday(s.id, iso)) return false;
+    if (s.permNights && shift !== "N") return false;
+    if (!s.permNights && shift === "N" && !nightPlanData?.plan?.[s.id]?.[iso]) return false;
+    if (!fwaAllows(s, iso, shift)) return false;
+    // DUAL HARD CEILING — checked dynamically so ADO insertions are reflected:
+    // 1. No hours remaining for another shift
+    const shiftHrs = shift === "N" ? 10 : 8;
+    if (hw[s.id] + shiftHrs > periodTarget[s.id]) return false;
+    // 2. Shift count ceiling (belt-and-braces, uses cached maxShifts as upper bound)
+    if (shiftCount[s.id] >= maxShifts[s.id]) return false;
+    const maxW = s.fwaConditions?.find(c => c.type === "MAX_HOURS_WEEK")?.value;
+    if (maxW && weekHrs(s.id, iso, shiftHrs) > maxW) return false;
+    if (s.cls === "GNP" && s.gnpStart && shift === "N" && new Date(iso) < addDays(new Date(s.gnpStart), 91)) return false;
+    if (shift === "N" && consecNights(s.id, iso) >= 4) return false;
+    if (shift !== "N" && consecShifts(s.id, iso) >= 5) return false;
+    if ((shift === "D" || shift === "E") && nightWithin47h(s.id, iso)) return false;
+    if (shift === "E" && onShift(s.id, isoDate(addDays(new Date(iso), -1)), "N")) return false;
     return true;
   }
 
@@ -262,93 +309,160 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   const maxGNPShift=Math.max(1,Math.floor(totalGNP/2));
   let numHasWorked=false;
 
-  // Phase 1: Nights
-  days.forEach(({iso})=>{
-    const eligible=staff.filter(s=>canWork(s,iso,"N")).sort((a,b)=>{
-      if(a.permNights&&!b.permNights)return -1; if(!a.permNights&&b.permNights)return 1;
-      return (periodTarget[b.id]-hw[b.id])-(periodTarget[a.id]-hw[a.id]);
+  // Helper: recompute remaining shifts for a staff member at any point in time
+  // Used after ADO insertions update hw mid-generation
+  function remainingShifts(s) {
+    const shiftHrs = s.permNights ? 10 : 8;
+    const hrsLeft = Math.max(0, periodTarget[s.id] - hw[s.id]);
+    return Math.floor(hrsLeft / shiftHrs);
+  }
+
+  // canWork checks remaining shifts dynamically (not cached maxShifts)
+  // so it stays accurate after ADO insertions change hw mid-run
+
+  // ── PHASE 1: Night shifts ─────────────────────────────────
+  days.forEach(({iso}) => {
+    const eligible = staff.filter(s => canWork(s,iso,"N")).sort((a,b) => {
+      if (a.permNights && !b.permNights) return -1;
+      if (!a.permNights && b.permNights) return  1;
+      return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
     });
-    let enCnt=0,gnpCnt=0,anumCnt=0,icOk=false;
-    for(const s of eligible){
-      if(roster[iso].N.length>=5)break;
-      if(s.cls==="EN"&&enCnt>=1)continue;
-      if(s.cls==="GNP"&&gnpCnt>=1)continue;
-      if(s.cls==="ANUM"){
-        if(anumCnt>=1){
-          const other=roster[iso].N.map(id=>staff.find(x=>x.id===id)).find(x=>x?.cls==="ANUM");
-          if(!other||other.hrs<80||s.hrs<80)continue;
+    let enCnt=0, gnpCnt=0, anumCnt=0, icOk=false;
+    for (const s of eligible) {
+      if (roster[iso].N.length >= 5) break;
+      if (s.cls==="EN"  && enCnt  >= 1) continue;
+      if (s.cls==="GNP" && gnpCnt >= 1) continue;
+      if (s.cls==="ANUM") {
+        if (anumCnt >= 1) {
+          const other = roster[iso].N.map(id=>staff.find(x=>x.id===id)).find(x=>x?.cls==="ANUM");
+          if (!other || other.hrs < 80 || s.hrs < 80) continue;
         }
         anumCnt++;
       }
-      if(s.cls==="EN")enCnt++; if(s.cls==="GNP")gnpCnt++;
-      roster[iso].N.push(s.id); hw[s.id]+=10;
-      if(isInCharge(s))icOk=true;
+      if (s.cls==="EN")  enCnt++;
+      if (s.cls==="GNP") gnpCnt++;
+      roster[iso].N.push(s.id);
+      hw[s.id] += 10;
+      shiftCount[s.id]++;
+      if (isInCharge(s)) icOk = true;
     }
-    if(!icOk&&roster[iso].N.length>0){
-      const ic=eligible.find(s=>!roster[iso].N.includes(s.id)&&isInCharge(s));
-      if(ic){roster[iso].N.push(ic.id);hw[ic.id]+=10;}
+    // In-charge fallback — must pass canWork
+    if (!icOk && roster[iso].N.length > 0) {
+      const ic = eligible.find(s =>
+        !roster[iso].N.includes(s.id) && isInCharge(s) && canWork(s,iso,"N")
+      );
+      if (ic) { roster[iso].N.push(ic.id); hw[ic.id]+=10; shiftCount[ic.id]++; }
     }
   });
 
-  // ADO accrual at each week boundary
-  days.filter(d=>d.di===6).forEach(sun=>{
-    const monIso=isoDate(addDays(sun.date,-6));
-    staff.filter(s=>s.hrs>=80).forEach(s=>{
-      let worked=false;
-      for(let i=0;i<7;i++){
+  // ── ADO accrual at each week boundary ─────────────────────
+  days.filter(d=>d.di===6).forEach(sun => {
+    const monIso = isoDate(addDays(sun.date,-6));
+    staff.filter(s=>s.hrs>=80).forEach(s => {
+      let worked = false;
+      for (let i=0;i<7;i++) {
         const k=isoDate(addDays(new Date(monIso),i));
-        if(roster[k]?.D.includes(s.id)||roster[k]?.E.includes(s.id)||roster[k]?.N.includes(s.id)||leaveMap[s.id][k]){worked=true;break;}
+        if (roster[k]?.D.includes(s.id)||roster[k]?.E.includes(s.id)||
+            roster[k]?.N.includes(s.id)||leaveMap[s.id][k]) { worked=true; break; }
       }
-      if(!worked)return;
-      adoAccrued[s.id]+=2;
-      const nightCtx=s.permNights||Array.from({length:7},(_,i)=>isoDate(addDays(new Date(monIso),i))).some(k=>nightPlanData?.plan?.[s.id]?.[k]);
-      tryInsertADO(s,sun.iso,nightCtx);
+      if (!worked) return;
+      adoAccrued[s.id] += 2;
+      const nightCtx = s.permNights ||
+        Array.from({length:7},(_,i)=>isoDate(addDays(new Date(monIso),i)))
+          .some(k=>nightPlanData?.plan?.[s.id]?.[k]);
+      tryInsertADO(s, sun.iso, nightCtx);
+      // IMPORTANT: After ADO insertion, hw[s.id] may have increased.
+      // maxShifts is dynamic via remainingShifts(), so canWork() stays accurate.
     });
   });
 
-  // Phase 2: Day & Evening
-  days.forEach(({iso,di,wknd})=>{
-    const BASE=wknd?9:10;
-    for(const shift of ["D","E"]){
-      const isNUMSlot=shift==="D"&&di>=1&&di<=3&&!numHasWorked;
-      const eligible=staff.filter(s=>{
-        if(!canWork(s,iso,shift))return false;
-        if(s.permNights)return false;
-        if(nightPlanData?.plan?.[s.id]?.[iso])return false;
-        return true;
-      }).sort((a,b)=>{
-        const aReq=!!(a.requests?.[`${iso}_${shift}`]),bReq=!!(b.requests?.[`${iso}_${shift}`]);
-        if(aReq&&!bReq)return -1; if(!aReq&&bReq)return 1;
-        if(wknd){const dw=(wkndCnt[a.id]||0)-(wkndCnt[b.id]||0);if(dw!==0)return dw;}
-        const rA=rotScore(a.id,iso,shift),rB=rotScore(b.id,iso,shift);
-        if(rA!==rB)return rA-rB;
-        return (periodTarget[b.id]-hw[b.id])-(periodTarget[a.id]-hw[a.id]);
-      });
-      let anumCnt=0,enCnt=0,gnpCnt=0,numOn=false,icOk=false;
-      for(const s of eligible){
-        const rem=periodTarget[s.id]-hw[s.id];
-        if(wknd&&roster[iso][shift].length>=BASE)break;
-        if(!wknd&&roster[iso][shift].length>=BASE&&rem<=0)continue;
-        if(rem<=0&&roster[iso][shift].length>=BASE)continue;
-        if(s.cls==="NUM"){if(!isNUMSlot||numHasWorked)continue;numOn=true;}
-        if(s.cls==="ANUM"){
-          if(anumCnt>=1)continue;
-          if(numOn||roster[iso][shift].some(id=>staff.find(x=>x.id===id)?.cls==="NUM"))continue;
-          anumCnt++;
-        }
-        if(s.cls==="EN"&&enCnt>=1)continue;
-        if(s.cls==="GNP"){if(gnpCnt>=maxGNPShift)continue;gnpCnt++;}
-        if(s.cls==="EN")enCnt++;
-        roster[iso][shift].push(s.id); hw[s.id]+=8;
-        if(wknd)wkndCnt[s.id]=(wkndCnt[s.id]||0)+1;
-        if(isInCharge(s))icOk=true;
-        if(s.cls==="NUM")numHasWorked=true;
+  // ── PHASE 2: Day & Evening ────────────────────────────────
+  // PRIORITY ORDER for filling shifts:
+  //   1. Weekend days (Sat/Sun) — fill these first across all staff
+  //   2. Monday and Friday — priority weekdays
+  //   3. Tuesday, Wednesday, Thursday — fill last (overstaffing allowed here)
+  //
+  // Within each priority tier, process D and E shifts.
+  // This ensures high-priority days are fully staffed before mid-week
+  // uses up staff shift allowances.
+
+  // Build day lists in priority order
+  const weekendDays = days.filter(d => d.wknd);
+  const monFriDays  = days.filter(d => !d.wknd && (d.di===0||d.di===4)); // Mon=0,Fri=4
+  const midWeekDays = days.filter(d => !d.wknd && d.di!==0 && d.di!==4);
+  const orderedDays = [...weekendDays, ...monFriDays, ...midWeekDays];
+
+  function fillShift(iso, di, wknd, shift) {
+    const BASE = wknd ? 9 : 10;
+    const isNUMSlot = shift==="D" && di>=1 && di<=3 && !numHasWorked;
+
+    const eligible = staff.filter(s => {
+      if (s.permNights) return false;
+      if (nightPlanData?.plan?.[s.id]?.[iso]) return false;
+      return canWork(s, iso, shift); // canWork uses dynamic remainingShifts check
+    }).sort((a,b) => {
+      const aReq = !!(a.requests?.[`${iso}_${shift}`]);
+      const bReq = !!(b.requests?.[`${iso}_${shift}`]);
+      if (aReq && !bReq) return -1;
+      if (!aReq && bReq) return  1;
+      if (wknd) {
+        const dw = (wkndCnt[a.id]||0) - (wkndCnt[b.id]||0);
+        if (dw !== 0) return dw;
       }
-      if(!icOk&&roster[iso][shift].length>0){
-        const ic=eligible.find(s=>!roster[iso][shift].includes(s.id)&&isInCharge(s)&&!s.permNights&&!nightPlanData?.plan?.[s.id]?.[iso]&&(periodTarget[s.id]-hw[s.id])>0);
-        if(ic){roster[iso][shift].push(ic.id);hw[ic.id]+=8;if(wknd)wkndCnt[ic.id]=(wkndCnt[ic.id]||0)+1;}
+      const rA=rotScore(a.id,iso,shift), rB=rotScore(b.id,iso,shift);
+      if (rA !== rB) return rA - rB;
+      // Most hours remaining first
+      return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
+    });
+
+    let anumCnt=0, enCnt=0, gnpCnt=0, numOn=false, icOk=false;
+
+    for (const s of eligible) {
+      // Weekend: hard stop at BASE
+      if (wknd && roster[iso][shift].length >= BASE) break;
+      // Weekday: stop at BASE unless staff still have hours to fill
+      if (!wknd && roster[iso][shift].length >= BASE) {
+        if (hw[s.id] >= periodTarget[s.id]) continue;
+      }
+
+      if (s.cls==="NUM") { if (!isNUMSlot||numHasWorked) continue; numOn=true; }
+      if (s.cls==="ANUM") {
+        if (anumCnt >= 1) continue;
+        if (numOn||roster[iso][shift].some(id=>staff.find(x=>x.id===id)?.cls==="NUM")) continue;
+        anumCnt++;
+      }
+      if (s.cls==="EN" && enCnt >= 1) continue;
+      if (s.cls==="GNP") { if (gnpCnt >= maxGNPShift) continue; gnpCnt++; }
+      if (s.cls==="EN") enCnt++;
+
+      roster[iso][shift].push(s.id);
+      hw[s.id] += 8;
+      shiftCount[s.id]++;
+      if (wknd) wkndCnt[s.id] = (wkndCnt[s.id]||0)+1;
+      if (isInCharge(s)) icOk = true;
+      if (s.cls==="NUM") numHasWorked = true;
+    }
+
+    // In-charge fallback — MUST pass canWork (no ceiling bypass)
+    if (!icOk && roster[iso][shift].length > 0) {
+      const ic = eligible.find(s =>
+        !roster[iso][shift].includes(s.id) &&
+        isInCharge(s) &&
+        canWork(s, iso, shift)
+      );
+      if (ic) {
+        roster[iso][shift].push(ic.id);
+        hw[ic.id] += 8;
+        shiftCount[ic.id]++;
+        if (wknd) wkndCnt[ic.id] = (wkndCnt[ic.id]||0)+1;
       }
     }
+  }
+
+  // Run shifts in priority order
+  orderedDays.forEach(({iso, di, wknd}) => {
+    fillShift(iso, di, wknd, "D");
+    fillShift(iso, di, wknd, "E");
   });
 
   // Merge ADO into leaveMap for display
@@ -360,7 +474,16 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
 
   // Hours summary
   const hoursSummary={};
-  staff.forEach(s=>{ hoursSummary[s.id]={target:periodTarget[s.id],worked:hw[s.id],adoCount:adoTaken[s.id],variance:hw[s.id]-periodTarget[s.id]}; });
+  staff.forEach(s=>{
+    hoursSummary[s.id]={
+      target:periodTarget[s.id],
+      worked:hw[s.id],
+      adoCount:adoTaken[s.id],
+      variance:hw[s.id]-periodTarget[s.id],
+      shifts:shiftCount[s.id],
+      maxShifts:maxShifts[s.id],
+    };
+  });
 
   // Warnings
   const warnings=[];
@@ -665,14 +788,14 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
             <table style={{borderCollapse:"collapse",width:"100%"}}>
               <thead>
                 <tr style={{background:"#060e18"}}>
-                  {["Staff","Class","Contract","Target","Worked","Variance","ADOs"].map(h=>(
+                  {["Staff","Class","Contract","Target","Worked","Variance","Shifts","ADOs"].map(h=>(
                     <th key={h} style={{...C.th,textAlign:"left",padding:"8px 12px",fontSize:11}}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {staff.filter(s=>!s.resigned).map((s,i)=>{
-                  const hs=roster.hoursSummary?.[s.id]||{target:s.hrs,worked:0,variance:0,adoCount:0};
+                  const hs=roster.hoursSummary?.[s.id]||{target:s.hrs,worked:0,variance:0,adoCount:0,shifts:0,maxShifts:0};
                   const cls=CLASSIFICATIONS[s.cls];
                   const ok=Math.abs(hs.variance)<=8,warn=Math.abs(hs.variance)<=16;
                   const col=ok?"#66bb6a":warn?"#ffa726":"#ef5350";
@@ -687,6 +810,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                         <span style={{color:col,fontWeight:700}}>{hs.variance>0?"+":""}{hs.variance}h</span>
                         {!ok&&<span style={{fontSize:9,marginLeft:4}}>{warn?"⚠":"✗"}</span>}
                       </td>
+                      <td style={{...C.td,padding:"8px 12px",color:"#7fb3d3"}}>{hs.shifts}/{hs.maxShifts}</td>
                       <td style={{...C.td,padding:"8px 12px",color:"#a5d6a7"}}>{hs.adoCount>0?`${hs.adoCount} ADO${hs.adoCount>1?"s":""}`:""}</td>
                     </tr>
                   );
