@@ -850,6 +850,28 @@ export default function App() {
 
   const rosterKeys=Object.keys(rosters).sort().reverse();
 
+  // ── Delete roster ──
+  async function handleDeleteRoster(key) {
+    const r = rosters[key]; if (!r) return;
+    if (r.locked) {
+      if (!confirm(`⚠️ WARNING: "${key}" is LOCKED.\n\nDeleting a locked roster is permanent and cannot be undone.\n\nAre you absolutely sure?`)) return;
+      if (!confirm(`FINAL CONFIRMATION\n\nDelete locked roster "${key}"?\n\nThis permanently removes all shift data for this period and cannot be reversed.\n\nClick OK only if you are certain.`)) return;
+    } else {
+      if (!confirm(`Delete roster "${key}"?\n\nThis is permanent and cannot be undone.\n\nAre you sure?`)) return;
+    }
+    setRostersState(prev => { const next={...prev}; delete next[key]; return next; });
+    try {
+      const { supabase } = await import("./supabase.js");
+      if (supabase) await supabase.from("rosters").delete().eq("id", key);
+    } catch(e) { console.error("Delete roster:", e); }
+    try {
+      const local=JSON.parse(localStorage.getItem("wr3_rosters")||"{}");
+      delete local[key]; localStorage.setItem("wr3_rosters", JSON.stringify(local));
+    } catch {}
+    if (activeKey===key) setActiveKey(null);
+    toast(`Roster deleted: ${key}`);
+  }
+
   if(loading)return(
     <div style={{minHeight:"100vh",background:"#06101a",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16}}>
       <div style={{fontSize:48}}>⚕</div>
@@ -874,67 +896,6 @@ export default function App() {
         <button style={C.exportBtn} onClick={handleExport}>⬇ Export XLSX</button>
       </header>
       <div style={C.main}>
-  // ── Delete roster ──
-  async function handleDeleteRoster(key) {
-    const r = rosters[key];
-    if (!r) return;
-    // Multi-step confirmation for locked rosters
-    if (r.locked) {
-      const step1 = confirm(`⚠️ WARNING: "${key}" is LOCKED.\n\nDeleting a locked roster is permanent and cannot be undone.\n\nAre you absolutely sure you want to delete it?`);
-      if (!step1) return;
-      const step2 = confirm(`FINAL CONFIRMATION\n\nDelete locked roster "${key}"?\n\nThis will permanently remove all shift data, hours summaries and warnings for this period. This cannot be reversed.\n\nClick OK only if you are certain.`);
-      if (!step2) return;
-    } else {
-      const confirmed = confirm(`Delete roster "${key}"?\n\nThis is permanent and cannot be undone. All shift data for this period will be lost.\n\nAre you sure?`);
-      if (!confirmed) return;
-    }
-    // Remove from state
-    setRostersState(prev => {
-      const next = { ...prev };
-      delete next[key];
-      return next;
-    });
-    // Remove from Supabase
-    if (typeof window !== "undefined") {
-      try {
-        const { supabase } = await import("./supabase.js");
-        if (supabase) await supabase.from("rosters").delete().eq("id", key);
-      } catch(e) { console.error("Delete roster:", e); }
-    }
-    // Remove from localStorage backup
-    try {
-      const local = JSON.parse(localStorage.getItem("wr3_rosters") || "{}");
-      delete local[key];
-      localStorage.setItem("wr3_rosters", JSON.stringify(local));
-    } catch {}
-    if (activeKey === key) setActiveKey(null);
-    toast(`Roster deleted: ${key}`);
-  }
-
-  // ── Delete roster ──
-  async function handleDeleteRoster(key) {
-    const r = rosters[key];
-    if (!r) return;
-    if (r.locked) {
-      if (!confirm(`⚠️ WARNING: "${key}" is LOCKED.\n\nDeleting a locked roster is permanent and cannot be undone.\n\nAre you absolutely sure?`)) return;
-      if (!confirm(`FINAL CONFIRMATION\n\nDelete locked roster "${key}"?\n\nThis permanently removes all shift data for this period.\n\nClick OK only if you are certain.`)) return;
-    } else {
-      if (!confirm(`Delete roster "${key}"?\n\nThis is permanent and cannot be undone.\n\nAre you sure?`)) return;
-    }
-    setRostersState(prev => { const next={...prev}; delete next[key]; return next; });
-    try {
-      const { supabase } = await import("./supabase.js");
-      if (supabase) await supabase.from("rosters").delete().eq("id", key);
-    } catch(e) { console.error("Delete roster:", e); }
-    try {
-      const local=JSON.parse(localStorage.getItem("wr3_rosters")||"{}");
-      delete local[key];
-      localStorage.setItem("wr3_rosters", JSON.stringify(local));
-    } catch {}
-    if (activeKey===key) setActiveKey(null);
-    toast(`Roster deleted: ${key}`);
-  }
-
         {tab==="roster"   &&<RosterTab   roster={activeRoster} staff={staff} rosterKeys={rosterKeys} activeKey={activeKey} setActiveKey={setActiveKey} rosters={rosters} setRosters={setRosters} onLock={handleLockRoster}/>}
         {tab==="generate" &&<GenerateTab cfg={genCfg} setCfg={setGenCfg} onGenerate={handleGenerate} staff={staff} nightPlanData={nightPlanData} rosters={rosters} onSuggestDate={suggestNextStartDate}/>}
         {tab==="staff"    &&<StaffTab    staff={staff} setStaff={setStaff} toast={toast}/>}
@@ -942,6 +903,7 @@ export default function App() {
         {tab==="nightplan"&&<NightPlanTab staff={staff} nightPlanData={nightPlanData} setNightPlanData={setNightPlanData} toast={toast}/>}
         {tab==="ado"      &&<ADOTab      staff={staff} rosters={rosters} adoAdjustments={adoAdjustments} setAdoAdjustments={setAdoAdjustments} toast={toast}/>}
         {tab==="history"  &&<HistoryTab  rosters={rosters} staff={staff} activeKey={activeKey} setActiveKey={setActiveKey} setTab={setTab} onDelete={handleDeleteRoster}/>}
+      </div>
       </div>
     </div>
   );
@@ -1906,6 +1868,7 @@ function LeaveTab({staff,setStaff,toast}){
 // ─── NIGHT PLAN TAB ──────────────────────────────────────────
 function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
   const [year,setYear]=useState(new Date().getFullYear());
+  const [view,setView]=useState("planner"); // "planner" | "timeline"
   const {groups,numGroups,staffPerBlock,permHoursPerFn}=autoComputeNightGroups(staff);
   const permStaff=staff.filter(s=>s.permNights);
   const gc=["#e53935","#fb8c00","#fdd835","#43a047","#1e88e5","#8e24aa","#00acc1","#f06292","#00897b","#6d4c41"];
@@ -1916,100 +1879,272 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
     toast(`Night plan generated for ${year}: ${result.groups.length} groups`);
   }
 
+  // Build fortnight list for selected year
+  const yearFns = (nightPlanData?.fns||[]).filter(fn=>new Date(fn.start).getFullYear()===year);
+
   return(
     <div>
-      <h2 style={C.pageH}>🌙 Night Shift Planner</h2>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:14,marginBottom:24}}>
-        <div style={C.card}>
-          <div style={C.cardH}>Coverage Calculation</div>
-          <div style={{fontSize:11,color:"#7fb3d3",lineHeight:2.1}}>
-            <div>Required: <b style={{color:"#a8dadc"}}>5 staff × 10h = 50h/shift</b></div>
-            <div>14 nights/block: <b style={{color:"#a8dadc"}}>700h total</b></div>
-            <div>Perm nights: <b style={{color:"#a8dadc"}}>{permHoursPerFn}h/fn</b></div>
-            <div>Rotating needed: <b style={{color:"#a8dadc"}}>{Math.max(0,700-permHoursPerFn)}h/block</b></div>
-            <div>Staff per block: <b style={{color:"#66bb6a"}}>{staffPerBlock}</b></div>
-            <div>Groups: <b style={{color:"#66bb6a"}}>{numGroups}</b></div>
-          </div>
-        </div>
-        <div style={C.card}>
-          <div style={C.cardH}>Permanent Nights</div>
-          {permStaff.length===0&&<div style={{fontSize:11,color:"#2a5070"}}>None configured</div>}
-          {permStaff.map(s=>{const cls=CLASSIFICATIONS[s.cls];return(
-            <div key={s.id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-              <span style={{width:7,height:7,borderRadius:"50%",background:cls?.color}}/>
-              <span style={{fontSize:11,color:"#c8d8e8"}}>{s.name}</span>
-              <span style={{fontSize:9,color:cls?.color}}>{s.cls}</span>
-              <span style={{fontSize:9,color:"#64b5f6",marginLeft:"auto"}}>{s.hrs}h</span>
-            </div>
-          );})}
-        </div>
-        <div style={C.card}>
-          <div style={C.cardH}>Auto-Generate Plan</div>
-          <div style={{fontSize:11,color:"#4a7fa0",marginBottom:12,lineHeight:1.7}}>Groups staff by classification and hours, ensures In-Charge coverage, rotates with 6–8 week gaps.</div>
-          <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:14}}>
-            <button style={C.btnSec} onClick={()=>setYear(y=>y-1)}>‹</button>
-            <strong style={{color:"#a8dadc",fontSize:18,minWidth:48,textAlign:"center"}}>{year}</strong>
-            <button style={C.btnSec} onClick={()=>setYear(y=>y+1)}>›</button>
-          </div>
-          <button style={C.btnPrimary} onClick={autoGen}>🔄 Auto-Generate {year}</button>
-          {nightPlanData&&<div style={{fontSize:10,color:"#66bb6a",marginTop:8}}>✅ Plan active — {nightPlanData.groups?.length} groups</div>}
+      <div style={C.toolbar}>
+        <h2 style={C.pageH}>🌙 Night Shift Planner</h2>
+        <div style={{display:"flex",gap:8}}>
+          <button style={{...C.selBtn,...(view==="planner"?C.selBtnOn:{})}} onClick={()=>setView("planner")}>⚙️ Planner</button>
+          <button style={{...C.selBtn,...(view==="timeline"?C.selBtnOn:{})}} onClick={()=>setView("timeline")}>📅 Annual Timeline</button>
         </div>
       </div>
 
-      {groups.length>0&&(
-        <>
-          <h3 style={C.sectionH}>Night Shift Groups</h3>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(210px,1fr))",gap:12,marginBottom:24}}>
-            {groups.map(g=>{
-              const color=gc[g.id-1]||"#64b5f6";
-              const members=staff.filter(s=>g.members.includes(s.id));
-              const hasIC=members.some(s=>isInCharge(s));
-              return(
-                <div key={g.id} style={{...C.card,borderColor:color+"66"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-                    <div style={{width:11,height:11,borderRadius:"50%",background:color}}/>
-                    <span style={{fontWeight:700,color,fontSize:13}}>Group {g.id}</span>
-                    <span style={{fontSize:9,color:"#4a7fa0"}}>{members.length} staff · {g.totalHours}h</span>
-                  </div>
-                  <div style={{fontSize:9,color:hasIC?"#66bb6a":"#ef5350",marginBottom:8}}>{hasIC?"✅ In-Charge covered":"⚠ No In-Charge!"}</div>
-                  {members.map(s=>{const cls=CLASSIFICATIONS[s.cls];return(
-                    <div key={s.id} style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
-                      <span style={{fontSize:9,color:cls?.color,background:cls?.color+"22",borderRadius:5,padding:"0 4px",fontWeight:700}}>{s.cls}</span>
-                      <span style={{fontSize:10,color:"#a8dadc"}}>{s.name}</span>
-                      <span style={{fontSize:9,color:"#4a7fa0",marginLeft:"auto"}}>{s.hrs}h</span>
-                    </div>
-                  );})}
+      {/* ── PLANNER VIEW ── */}
+      {view==="planner"&&(
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:14,marginBottom:24}}>
+            <div style={C.card}>
+              <div style={C.cardH}>Coverage Calculation</div>
+              <div style={{fontSize:11,color:"#7fb3d3",lineHeight:2.1}}>
+                <div>Required: <b style={{color:"#a8dadc"}}>5 staff × 10h = 50h/shift</b></div>
+                <div>14 nights/block: <b style={{color:"#a8dadc"}}>700h total</b></div>
+                <div>Perm nights: <b style={{color:"#a8dadc"}}>{permHoursPerFn}h/fn</b></div>
+                <div>Rotating needed: <b style={{color:"#a8dadc"}}>{Math.max(0,700-permHoursPerFn)}h/block</b></div>
+                <div>Staff per block: <b style={{color:"#66bb6a"}}>{staffPerBlock}</b></div>
+                <div>Groups: <b style={{color:"#66bb6a"}}>{numGroups}</b></div>
+              </div>
+            </div>
+            <div style={C.card}>
+              <div style={C.cardH}>Permanent Nights</div>
+              {permStaff.length===0&&<div style={{fontSize:11,color:"#2a5070"}}>None configured</div>}
+              {permStaff.map(s=>{const cls=CLASSIFICATIONS[s.cls];return(
+                <div key={s.id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                  <span style={{width:7,height:7,borderRadius:"50%",background:cls?.color}}/>
+                  <span style={{fontSize:11,color:"#c8d8e8"}}>{s.name}</span>
+                  <span style={{fontSize:9,color:cls?.color}}>{s.cls}</span>
+                  <span style={{fontSize:9,color:"#64b5f6",marginLeft:"auto"}}>{s.hrs}h</span>
                 </div>
-              );
-            })}
+              );})}
+            </div>
+            <div style={C.card}>
+              <div style={C.cardH}>Auto-Generate Plan</div>
+              <div style={{fontSize:11,color:"#4a7fa0",marginBottom:12,lineHeight:1.7}}>Groups staff by classification and hours, ensures In-Charge coverage, rotates with 6–8 week gaps.</div>
+              <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:14}}>
+                <button style={C.btnSec} onClick={()=>setYear(y=>y-1)}>‹</button>
+                <strong style={{color:"#a8dadc",fontSize:18,minWidth:48,textAlign:"center"}}>{year}</strong>
+                <button style={C.btnSec} onClick={()=>setYear(y=>y+1)}>›</button>
+              </div>
+              <button style={C.btnPrimary} onClick={autoGen}>🔄 Auto-Generate {year}</button>
+              {nightPlanData&&<div style={{fontSize:10,color:"#66bb6a",marginTop:8}}>✅ Plan active — {nightPlanData.groups?.length} groups</div>}
+            </div>
           </div>
-        </>
+
+          {groups.length>0&&(
+            <>
+              <h3 style={C.sectionH}>Night Shift Groups</h3>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(210px,1fr))",gap:12,marginBottom:24}}>
+                {groups.map(g=>{
+                  const color=gc[g.id-1]||"#64b5f6";
+                  const members=staff.filter(s=>g.members.includes(s.id));
+                  const hasIC=members.some(s=>isInCharge(s));
+                  return(
+                    <div key={g.id} style={{...C.card,borderColor:color+"66"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                        <div style={{width:11,height:11,borderRadius:"50%",background:color}}/>
+                        <span style={{fontWeight:700,color,fontSize:13}}>Group {g.id}</span>
+                        <span style={{fontSize:9,color:"#4a7fa0"}}>{members.length} staff · {g.totalHours}h</span>
+                      </div>
+                      <div style={{fontSize:9,color:hasIC?"#66bb6a":"#ef5350",marginBottom:8}}>{hasIC?"✅ In-Charge covered":"⚠ No In-Charge!"}</div>
+                      {members.map(s=>{const cls=CLASSIFICATIONS[s.cls];return(
+                        <div key={s.id} style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
+                          <span style={{fontSize:9,color:cls?.color,background:cls?.color+"22",borderRadius:5,padding:"0 4px",fontWeight:700}}>{s.cls}</span>
+                          <span style={{fontSize:10,color:"#a8dadc"}}>{s.name}</span>
+                          <span style={{fontSize:9,color:"#4a7fa0",marginLeft:"auto"}}>{s.hrs}h</span>
+                        </div>
+                      );})}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {nightPlanData&&(
+            <>
+              <h3 style={C.sectionH}>Fortnight Assignment — {year}</h3>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(158px,1fr))",gap:8}}>
+                {yearFns.map(fn=>{
+                  const gid=nightPlanData.groupAssignments?.[fn.key];
+                  const color=gid?gc[gid-1]||"#64b5f6":"#1a3050";
+                  const group=nightPlanData.groups?.find(g=>g.id===gid);
+                  return(
+                    <div key={fn.key} style={{background:"#0a1525",border:`1px solid ${color}55`,borderRadius:7,padding:"8px 10px"}}>
+                      <div style={{fontSize:9,color:"#4a7fa0"}}>Fn {fn.idx+1}</div>
+                      <div style={{fontSize:10,color:"#7fb3d3",marginBottom:5}}>{fmtShort(fn.start)} – {fmtShort(fn.end)}</div>
+                      {gid?(
+                        <div style={{display:"flex",alignItems:"center",gap:5}}>
+                          <div style={{width:8,height:8,borderRadius:"50%",background:color}}/>
+                          <span style={{fontSize:10,fontWeight:700,color}}>Group {gid}</span>
+                          <span style={{fontSize:9,color:"#4a7fa0"}}>{group?.members?.length||0} staff</span>
+                        </div>
+                      ):<span style={{fontSize:9,color:"#2a5070"}}>Unassigned</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
       )}
 
-      {nightPlanData&&(
-        <>
-          <h3 style={C.sectionH}>Fortnight Assignment — {year}</h3>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(158px,1fr))",gap:8}}>
-            {(nightPlanData.fns||[]).filter(fn=>new Date(fn.start).getFullYear()===year).map(fn=>{
-              const gid=nightPlanData.groupAssignments?.[fn.key];
-              const color=gid?gc[gid-1]||"#64b5f6":"#1a3050";
-              const group=nightPlanData.groups?.find(g=>g.id===gid);
-              return(
-                <div key={fn.key} style={{background:"#0a1525",border:`1px solid ${color}55`,borderRadius:7,padding:"8px 10px"}}>
-                  <div style={{fontSize:9,color:"#4a7fa0"}}>Fn {fn.idx+1}</div>
-                  <div style={{fontSize:10,color:"#7fb3d3",marginBottom:5}}>{fmtShort(fn.start)} – {fmtShort(fn.end)}</div>
-                  {gid?(
-                    <div style={{display:"flex",alignItems:"center",gap:5}}>
-                      <div style={{width:8,height:8,borderRadius:"50%",background:color}}/>
-                      <span style={{fontSize:10,fontWeight:700,color}}>Group {gid}</span>
-                      <span style={{fontSize:9,color:"#4a7fa0"}}>{group?.members?.length||0} staff</span>
-                    </div>
-                  ):<span style={{fontSize:9,color:"#2a5070"}}>Unassigned</span>}
-                </div>
-              );
-            })}
+      {/* ── ANNUAL TIMELINE VIEW ── */}
+      {view==="timeline"&&(
+        <div>
+          <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
+            <div style={{display:"flex",gap:8,alignItems:"center",background:"#0a1828",borderRadius:8,border:"1px solid #1a3050",padding:"6px 12px"}}>
+              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y-1)}>‹</button>
+              <strong style={{color:"#a8dadc",fontSize:16,minWidth:44,textAlign:"center"}}>{year}</strong>
+              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y+1)}>›</button>
+            </div>
+            {!nightPlanData&&<span style={{fontSize:11,color:"#ef5350"}}>⚠ No night plan generated — go to Planner tab first</span>}
           </div>
-        </>
+
+          {/* Group colour legend */}
+          {nightPlanData&&(
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
+              {(nightPlanData.groups||[]).map(g=>{
+                const color=gc[g.id-1]||"#64b5f6";
+                const members=staff.filter(s=>g.members.includes(s.id));
+                return(
+                  <div key={g.id} style={{display:"flex",alignItems:"center",gap:6,background:"#0a1828",border:`1px solid ${color}55`,borderRadius:7,padding:"5px 10px"}}>
+                    <div style={{width:10,height:10,borderRadius:"50%",background:color,flexShrink:0}}/>
+                    <span style={{fontSize:11,fontWeight:700,color}}> Group {g.id}</span>
+                    <span style={{fontSize:10,color:"#4a7fa0"}}>({members.length} staff)</span>
+                  </div>
+                );
+              })}
+              <div style={{display:"flex",alignItems:"center",gap:6,background:"#0a1828",border:"1px solid #1a3050",borderRadius:7,padding:"5px 10px"}}>
+                <div style={{width:10,height:10,borderRadius:"50%",background:"#3949ab",flexShrink:0}}/>
+                <span style={{fontSize:11,fontWeight:700,color:"#7986cb"}}>Permanent Nights</span>
+              </div>
+            </div>
+          )}
+
+          {/* Timeline grid — months across top, staff down the side */}
+          {nightPlanData&&(()=>{
+            // Build a day-level map: iso -> groupId (or "perm" for perm nights)
+            const dayMap={};
+            yearFns.forEach(fn=>{
+              const gid=nightPlanData.groupAssignments?.[fn.key];
+              if(!gid)return;
+              for(let d=0;d<14;d++){
+                const iso=isoDate(addDays(fn.start,d));
+                if(new Date(iso).getFullYear()===year) dayMap[iso]=gid;
+              }
+            });
+            // Perm nights always show
+            permStaff.forEach(s=>{ /* handled by row rendering */ });
+
+            // All staff who appear in any night group or are perm nights
+            const nightStaff=[
+              ...permStaff,
+              ...(nightPlanData.groups||[]).flatMap(g=>
+                staff.filter(s=>g.members.includes(s.id)&&!s.permNights)
+              ),
+            ].filter((s,i,arr)=>arr.findIndex(x=>x.id===s.id)===i); // dedupe
+
+            // Build month columns: Jan–Dec, each month = array of days in that month for this year
+            const months=Array.from({length:12},(_,m)=>{
+              const days=[];
+              let d=new Date(year,m,1);
+              while(d.getMonth()===m){ days.push(isoDate(d)); d=addDays(d,1); }
+              return {month:m,label:MONTH_NAMES[m],days};
+            });
+
+            return(
+              <div style={{overflowX:"auto"}}>
+                <table style={{borderCollapse:"collapse",tableLayout:"fixed",fontSize:10}}>
+                  <thead>
+                    <tr>
+                      <th style={{...C.th,minWidth:160,textAlign:"left",paddingLeft:10,position:"sticky",left:0,background:"#06101a",zIndex:4}}>Staff</th>
+                      {months.map(({label,days,month})=>(
+                        <th key={month} colSpan={days.length} style={{
+                          ...C.th,background:"#060e18",color:"#4fc3f7",
+                          borderLeft:"2px solid #1a3050",fontSize:11,padding:"6px 4px",
+                          minWidth:days.length*12,
+                        }}>{label}</th>
+                      ))}
+                    </tr>
+                    {/* Day numbers row */}
+                    <tr>
+                      <th style={{...C.th,position:"sticky",left:0,background:"#06101a",zIndex:4}}/>
+                      {months.flatMap(({days})=>days.map(iso=>{
+                        const dt=new Date(iso); const di=dayIdx(iso); const wknd=di>=5;
+                        return(
+                          <th key={iso} style={{
+                            ...C.th,minWidth:12,maxWidth:12,padding:"2px 0",fontSize:7,
+                            background:wknd?"#130a1a":"#080f1a",
+                            color:wknd?"#3a1a50":"#2a5070",
+                            borderLeft:dt.getDate()===1?"2px solid #1a3050":"none",
+                          }}>{dt.getDate()===1||dt.getDate()%5===0?dt.getDate():""}</th>
+                        );
+                      }))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {nightStaff.map((s,ri)=>{
+                      const cls=CLASSIFICATIONS[s.cls];
+                      // Find which group this staff belongs to
+                      const staffGroup=nightPlanData.groups?.find(g=>g.members.includes(s.id));
+                      const staffGroupColor=staffGroup?gc[staffGroup.id-1]||"#64b5f6":null;
+
+                      return(
+                        <tr key={s.id} style={{background:ri%2===0?"#0a1828":"#07101e"}}>
+                          <td style={{
+                            ...C.td,padding:"3px 10px",position:"sticky",left:0,
+                            background:ri%2===0?"#0a1828":"#07101e",zIndex:2,
+                            borderRight:"1px solid #1a3050",minWidth:160,
+                          }}>
+                            <div style={{display:"flex",alignItems:"center",gap:6}}>
+                              {staffGroupColor&&<div style={{width:7,height:7,borderRadius:"50%",background:staffGroupColor,flexShrink:0}}/>}
+                              {s.permNights&&<div style={{width:7,height:7,borderRadius:"50%",background:"#3949ab",flexShrink:0}}/>}
+                              <span style={{fontSize:11,color:"#c8d8e8",whiteSpace:"nowrap"}}>{s.name}</span>
+                              <span style={{fontSize:9,color:cls?.color,marginLeft:"auto"}}>{s.cls}</span>
+                            </div>
+                          </td>
+                          {months.flatMap(({days})=>days.map(iso=>{
+                            const dt=new Date(iso);
+                            const isNightBlock = s.permNights || (nightPlanData.plan?.[s.id]?.[iso]);
+                            const gid=isNightBlock&&!s.permNights?dayMap[iso]:null;
+                            const color=s.permNights?"#3949ab":(gid?gc[gid-1]||"#64b5f6":null);
+                            const wknd=dayIdx(iso)>=5;
+                            return(
+                              <td key={iso} style={{
+                                ...C.td,
+                                padding:0,
+                                minWidth:12,maxWidth:12,
+                                background:isNightBlock
+                                  ?(color+"99"||"#1a237e99")
+                                  :wknd?"#0d0814":"transparent",
+                                borderLeft:dt.getDate()===1?"2px solid #1a3050":"none",
+                                borderBottom:"1px solid #0a1525",
+                              }} title={isNightBlock?`${s.name}: Night${s.permNights?" (Perm)":` - Group ${gid}`} — ${iso}`:""}/>
+                            );
+                          }))}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <div style={{fontSize:10,color:"#2a5070",marginTop:10}}>
+                  Each column = 1 day. Coloured blocks = night shifts assigned. Scroll horizontally to see the full year.
+                </div>
+              </div>
+            );
+          })()}
+
+          {!nightPlanData&&(
+            <div style={C.empty}>
+              <div style={{fontSize:36,marginBottom:8}}>🌙</div>
+              <div style={C.emptyH}>No Night Plan Generated</div>
+              <div style={C.emptySub}>Go to the Planner tab, select a year, and click Auto-Generate.</div>
+              <button style={{...C.btnPrimary,marginTop:16}} onClick={()=>setView("planner")}>Go to Planner →</button>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
