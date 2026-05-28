@@ -2675,7 +2675,8 @@ function HistoryTab({ rosters, staff, activeKey, setActiveKey, setTab, onDelete 
 }
 
 // ─── STYLES ──────────────────────────────────────────────────
-const C = {       {minHeight:"100vh",background:"#06101a",color:"#c8d8e8",fontFamily:"'DM Mono','Courier New',monospace",fontSize:13},
+const C = {
+  app:       {minHeight:"100vh",background:"#06101a",color:"#c8d8e8",fontFamily:"'DM Mono','Courier New',monospace",fontSize:13},
   header:    {display:"flex",alignItems:"center",gap:16,padding:"10px 22px",background:"#04090f",borderBottom:"1px solid #112030",flexWrap:"wrap"},
   brand:     {display:"flex",alignItems:"center",gap:10,marginRight:6},
   brandTitle:{fontSize:16,fontWeight:700,color:"#4fc3f7",letterSpacing:2,textTransform:"uppercase"},
