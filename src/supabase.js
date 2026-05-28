@@ -191,3 +191,38 @@ function deserialiseRoster(row) {
     weeks:        row.weeks,
   };
 }
+
+// ── ADO Adjustments ─────────────────────────────────────────
+export async function loadADOAdjustments(fallback = {}) {
+  if (!supabase) {
+    try { return JSON.parse(localStorage.getItem("wr3_adoAdj") || "{}"); } catch { return fallback; }
+  }
+  const { data, error } = await supabase.from("ado_adjustments").select("*").order("date");
+  if (error) { console.error("loadADOAdjustments:", error); return fallback; }
+  // Group by staff_id: { staffId: [{ id, date, value, note }] }
+  const result = {};
+  (data || []).forEach(row => {
+    if (!result[row.staff_id]) result[row.staff_id] = [];
+    result[row.staff_id].push({ id: row.id, date: row.date, value: row.value, note: row.note });
+  });
+  return result;
+}
+
+export async function saveADOAdjustment(staffId, entry) {
+  // entry: { id, date, value, note }
+  if (!supabase) return;
+  const { error } = await supabase.from("ado_adjustments").upsert({
+    id:       entry.id,
+    staff_id: staffId,
+    date:     entry.date,
+    value:    entry.value,
+    note:     entry.note || "",
+  }, { onConflict: "id" });
+  if (error) console.error("saveADOAdjustment:", error);
+}
+
+export async function deleteADOAdjustment(entryId) {
+  if (!supabase) return;
+  const { error } = await supabase.from("ado_adjustments").delete().eq("id", entryId);
+  if (error) console.error("deleteADOAdjustment:", error);
+}

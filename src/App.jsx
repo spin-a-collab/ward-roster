@@ -4,9 +4,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
 import {
-  loadStaff, saveStaff, deleteStaffMember,
+  loadStaff, saveStaff,
   loadRosters, saveRoster, updateRosterLock,
   loadNightPlan, saveNightPlan,
+  loadADOAdjustments, saveADOAdjustment, deleteADOAdjustment,
 } from "./supabase.js";
 
 const CLASSIFICATIONS = {
@@ -718,9 +719,14 @@ export default function App() {
   useEffect(()=>{
     async function init(){
       setLoading(true);
-      try{
-        const [s,r,n]=await Promise.all([loadStaff(SAMPLE_STAFF),loadRosters({}),loadNightPlan(null)]);
-        setStaffState(s); setRostersState(r); setNightPlanState(n);
+      try {
+        const [s,r,n,ado]=await Promise.all([
+          loadStaff(SAMPLE_STAFF),
+          loadRosters({}),
+          loadNightPlan(null),
+          loadADOAdjustments({}),
+        ]);
+        setStaffState(s); setRostersState(r); setNightPlanState(n); setAdoAdjustments(ado);
         const keys=Object.keys(r).sort();
         if(keys.length>0)setActiveKey(keys[keys.length-1]);
       }catch(e){ console.error("Init:",e); }
@@ -837,6 +843,11 @@ export default function App() {
   }
 
   const activeRoster=activeKey?rosters[activeKey]:null;
+  const [adoAdjustments,setAdoAdjustments] = useState({});
+
+  // Persist ADO adjustments — loaded from Supabase in init()
+  // No separate useEffect needed; saves happen per-operation in ADOTab
+
   const rosterKeys=Object.keys(rosters).sort().reverse();
 
   if(loading)return(
@@ -856,18 +867,81 @@ export default function App() {
           <div><div style={C.brandTitle}>WardRoster</div><div style={C.brandSub}>Clinical Scheduling System v3.1</div></div>
         </div>
         <nav style={C.nav}>
-          {[["roster","📋 Roster"],["generate","⚡ Generate"],["staff","👥 Staff"],["leave","📅 Leave & Requests"],["nightplan","🌙 Night Planner"]].map(([v,l])=>(
+          {[["roster","📋 Roster"],["generate","⚡ Generate"],["staff","👥 Staff"],["leave","📅 Leave & Requests"],["nightplan","🌙 Night Planner"],["ado","🗓 ADO Ledger"],["history","🕐 History"]].map(([v,l])=>(
             <button key={v} style={{...C.navBtn,...(tab===v?C.navActive:{})}} onClick={()=>setTab(v)}>{l}</button>
           ))}
         </nav>
         <button style={C.exportBtn} onClick={handleExport}>⬇ Export XLSX</button>
       </header>
       <div style={C.main}>
+  // ── Delete roster ──
+  async function handleDeleteRoster(key) {
+    const r = rosters[key];
+    if (!r) return;
+    // Multi-step confirmation for locked rosters
+    if (r.locked) {
+      const step1 = confirm(`⚠️ WARNING: "${key}" is LOCKED.\n\nDeleting a locked roster is permanent and cannot be undone.\n\nAre you absolutely sure you want to delete it?`);
+      if (!step1) return;
+      const step2 = confirm(`FINAL CONFIRMATION\n\nDelete locked roster "${key}"?\n\nThis will permanently remove all shift data, hours summaries and warnings for this period. This cannot be reversed.\n\nClick OK only if you are certain.`);
+      if (!step2) return;
+    } else {
+      const confirmed = confirm(`Delete roster "${key}"?\n\nThis is permanent and cannot be undone. All shift data for this period will be lost.\n\nAre you sure?`);
+      if (!confirmed) return;
+    }
+    // Remove from state
+    setRostersState(prev => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    // Remove from Supabase
+    if (typeof window !== "undefined") {
+      try {
+        const { supabase } = await import("./supabase.js");
+        if (supabase) await supabase.from("rosters").delete().eq("id", key);
+      } catch(e) { console.error("Delete roster:", e); }
+    }
+    // Remove from localStorage backup
+    try {
+      const local = JSON.parse(localStorage.getItem("wr3_rosters") || "{}");
+      delete local[key];
+      localStorage.setItem("wr3_rosters", JSON.stringify(local));
+    } catch {}
+    if (activeKey === key) setActiveKey(null);
+    toast(`Roster deleted: ${key}`);
+  }
+
+  // ── Delete roster ──
+  async function handleDeleteRoster(key) {
+    const r = rosters[key];
+    if (!r) return;
+    if (r.locked) {
+      if (!confirm(`⚠️ WARNING: "${key}" is LOCKED.\n\nDeleting a locked roster is permanent and cannot be undone.\n\nAre you absolutely sure?`)) return;
+      if (!confirm(`FINAL CONFIRMATION\n\nDelete locked roster "${key}"?\n\nThis permanently removes all shift data for this period.\n\nClick OK only if you are certain.`)) return;
+    } else {
+      if (!confirm(`Delete roster "${key}"?\n\nThis is permanent and cannot be undone.\n\nAre you sure?`)) return;
+    }
+    setRostersState(prev => { const next={...prev}; delete next[key]; return next; });
+    try {
+      const { supabase } = await import("./supabase.js");
+      if (supabase) await supabase.from("rosters").delete().eq("id", key);
+    } catch(e) { console.error("Delete roster:", e); }
+    try {
+      const local=JSON.parse(localStorage.getItem("wr3_rosters")||"{}");
+      delete local[key];
+      localStorage.setItem("wr3_rosters", JSON.stringify(local));
+    } catch {}
+    if (activeKey===key) setActiveKey(null);
+    toast(`Roster deleted: ${key}`);
+  }
+
         {tab==="roster"   &&<RosterTab   roster={activeRoster} staff={staff} rosterKeys={rosterKeys} activeKey={activeKey} setActiveKey={setActiveKey} rosters={rosters} setRosters={setRosters} onLock={handleLockRoster}/>}
         {tab==="generate" &&<GenerateTab cfg={genCfg} setCfg={setGenCfg} onGenerate={handleGenerate} staff={staff} nightPlanData={nightPlanData} rosters={rosters} onSuggestDate={suggestNextStartDate}/>}
         {tab==="staff"    &&<StaffTab    staff={staff} setStaff={setStaff} toast={toast}/>}
         {tab==="leave"    &&<LeaveTab    staff={staff} setStaff={setStaff} toast={toast}/>}
         {tab==="nightplan"&&<NightPlanTab staff={staff} nightPlanData={nightPlanData} setNightPlanData={setNightPlanData} toast={toast}/>}
+        {tab==="ado"      &&<ADOTab      staff={staff} rosters={rosters} adoAdjustments={adoAdjustments} setAdoAdjustments={setAdoAdjustments} toast={toast}/>}
+        {tab==="history"  &&<HistoryTab  rosters={rosters} staff={staff} activeKey={activeKey} setActiveKey={setActiveKey} setTab={setTab} onDelete={handleDeleteRoster}/>}
       </div>
     </div>
   );
@@ -1941,9 +2015,533 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
   );
 }
 
+// ─── ADO LEDGER TAB ──────────────────────────────────────────
+// Shows each FT staff member's ADO balance across all saved rosters.
+// Balance = ADOs auto-inserted by generator + manual adjustments by NUM.
+// NUM can manually add/subtract ADOs to account for changes after roster was locked.
+
+function ADOTab({ staff, rosters, adoAdjustments, setAdoAdjustments, toast }) {
+  const [editingId, setEditingId]   = useState(null); // staffId being edited
+  const [adjNote, setAdjNote]       = useState("");
+  const [adjValue, setAdjValue]     = useState(0);    // +/- number of ADOs
+  const [filterCls, setFilterCls]   = useState("ALL");
+  const [showHistory, setShowHistory] = useState(null); // staffId whose history is open
+
+  // Only FT staff (80h+) accrue ADOs
+  const eligibleStaff = staff.filter(s => s.hrs >= 80 && !s.resigned);
+  const filtered = eligibleStaff.filter(s => filterCls === "ALL" || s.cls === filterCls);
+
+  // Sort rosters chronologically
+  const sortedRosterKeys = Object.keys(rosters).sort();
+
+  // Compute ADO summary for each staff member across ALL rosters
+  function computeADO(staffId) {
+    let autoTotal = 0;
+    const rosterBreakdown = [];
+
+    sortedRosterKeys.forEach(key => {
+      const r = rosters[key];
+      if (!r) return;
+      const inserted = r.adoInserted?.[staffId]?.length || 0;
+      if (inserted > 0) {
+        rosterBreakdown.push({
+          key,
+          startDate: r.startDate || key.split("_w")[0],
+          weeks: r.weeks || 2,
+          count: inserted,
+          dates: r.adoInserted?.[staffId] || [],
+          locked: r.locked || false,
+        });
+        autoTotal += inserted;
+      }
+    });
+
+    // Manual adjustments: array of { date, value, note }
+    const adjustments = adoAdjustments[staffId] || [];
+    const manualTotal = adjustments.reduce((sum, a) => sum + a.value, 0);
+
+    return {
+      autoTotal,
+      manualTotal,
+      balance: autoTotal + manualTotal,
+      rosterBreakdown,
+      adjustments,
+    };
+  }
+
+  function addAdjustment() {
+    if (!editingId) return;
+    if (adjValue === 0) return toast("Enter a non-zero adjustment value", "err");
+    const entry = {
+      id:    Date.now(),
+      date:  isoDate(new Date()),
+      value: adjValue,
+      note:  adjNote.trim() || (adjValue > 0 ? "Manual addition" : "Manual deduction"),
+    };
+    setAdoAdjustments(prev => {
+      const next = { ...prev, [editingId]: [...(prev[editingId] || []), entry] };
+      saveADOAdjustment(editingId, entry); // persist to Supabase
+      return next;
+    });
+    setEditingId(null); setAdjNote(""); setAdjValue(0);
+    toast(`ADO adjustment saved for ${staff.find(s=>s.id===editingId)?.name}`);
+  }
+
+  function removeAdjustment(staffId, entryId) {
+    setAdoAdjustments(prev => {
+      const next = { ...prev, [staffId]: (prev[staffId]||[]).filter(a=>a.id!==entryId) };
+      deleteADOAdjustment(entryId); // remove from Supabase
+      return next;
+    });
+    toast("Adjustment removed");
+  }
+
+  // Balance colour
+  function balColor(bal) {
+    if (bal <= 0) return "#ef5350";
+    if (bal === 1) return "#ffa726";
+    return "#66bb6a";
+  }
+
+  // Export ADO ledger to Excel
+  function exportLedger() {
+    const wb = XLSX.utils.book_new();
+    const rows = [["Staff","Classification","Contract","ADOs (auto)","ADOs (manual adj.)","Balance","Notes"]];
+    eligibleStaff.forEach(s => {
+      const ado = computeADO(s.id);
+      rows.push([s.name, s.cls, `${s.hrs}h/fn`, ado.autoTotal, ado.manualTotal, ado.balance,
+        ado.adjustments.map(a=>`${a.date}: ${a.value>0?"+":""}${a.value} (${a.note})`).join("; ")
+      ]);
+    });
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws["!cols"] = [20,8,8,10,14,8,40].map(w=>({wch:w}));
+    XLSX.utils.book_append_sheet(wb, ws, "ADO Ledger");
+    XLSX.writeFile(wb, `ADO_Ledger_${isoDate(new Date())}.xlsx`);
+    toast("ADO ledger exported");
+  }
+
+  return (
+    <div>
+      <div style={C.toolbar}>
+        <h2 style={C.pageH}>🗓 ADO Ledger</h2>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <select style={C.sel} value={filterCls} onChange={e=>setFilterCls(e.target.value)}>
+            <option value="ALL">All Classifications</option>
+            {Object.keys(CLASSIFICATIONS).map(k=><option key={k} value={k}>{k}</option>)}
+          </select>
+          <button style={C.btnSec} onClick={exportLedger}>⬇ Export Ledger</button>
+        </div>
+      </div>
+
+      {/* Info banner */}
+      <div style={{background:"#0a1525",border:"1px solid #1a3050",borderRadius:8,padding:"10px 16px",marginBottom:16,fontSize:11,color:"#4a7fa0",lineHeight:1.8}}>
+        <b style={{color:"#7fb3d3"}}>ADO Accrual Rules:</b> Full-time staff (80h+/fn) accrue 2h/week.
+        Day/evening staff earn 1 ADO per 4-week cycle (8h). Night staff earn 1 ADO per 5-week cycle (10h).
+        ADOs are auto-inserted by the roster generator. Use <b style={{color:"#a5d6a7"}}>+ Adjustment</b> to record
+        ADOs taken outside of a generated roster, or to correct the balance manually.
+      </div>
+
+      {eligibleStaff.length === 0 && (
+        <div style={C.empty}>
+          <div style={{fontSize:36,marginBottom:8}}>🗓</div>
+          <div style={C.emptyH}>No Full-Time Staff Found</div>
+          <div style={C.emptySub}>ADOs only apply to staff contracted at 80h/fortnight or more.</div>
+        </div>
+      )}
+
+      {/* Ledger table */}
+      {filtered.length > 0 && (
+        <div style={{border:"1px solid #1a3050",borderRadius:8,overflow:"hidden",marginBottom:24}}>
+          <table style={{borderCollapse:"collapse",width:"100%"}}>
+            <thead>
+              <tr style={{background:"#060e18"}}>
+                {["Staff","Class","Contract","ADOs Rostered","Adjustments","Balance",""].map(h=>(
+                  <th key={h} style={{...C.th,textAlign:"left",padding:"10px 14px",fontSize:11}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((s,i) => {
+                const ado    = computeADO(s.id);
+                const cls    = CLASSIFICATIONS[s.cls];
+                const bal    = ado.balance;
+                const isOpen = showHistory === s.id;
+
+                return (
+                  <>
+                    <tr key={s.id} style={{background:i%2===0?"#0a1828":"#07101e",borderTop:"1px solid #0d1e30"}}>
+                      <td style={{...C.td,padding:"10px 14px",fontWeight:600,color:"#c8d8e8"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:7}}>
+                          <span style={{width:8,height:8,borderRadius:"50%",background:cls?.color,flexShrink:0}}/>
+                          {s.name}
+                          {s.permNights && <span style={C.bdg("#1a237e","#7986cb")}>Nights</span>}
+                        </div>
+                      </td>
+                      <td style={{...C.td,padding:"10px 14px"}}>
+                        <span style={{fontSize:10,color:cls?.color,background:cls?.color+"22",borderRadius:6,padding:"1px 7px",fontWeight:700}}>{s.cls}</span>
+                      </td>
+                      <td style={{...C.td,padding:"10px 14px",color:"#7fb3d3",fontSize:11}}>{s.hrs}h/fn</td>
+                      <td style={{...C.td,padding:"10px 14px",color:"#a5d6a7",fontWeight:700}}>
+                        {ado.autoTotal} ADO{ado.autoTotal!==1?"s":""}
+                        {ado.rosterBreakdown.length>0&&(
+                          <button style={{...C.btnSec,fontSize:9,padding:"2px 7px",marginLeft:8}} onClick={()=>setShowHistory(isOpen?null:s.id)}>
+                            {isOpen?"▲ Hide":"▼ Detail"}
+                          </button>
+                        )}
+                      </td>
+                      <td style={{...C.td,padding:"10px 14px"}}>
+                        {ado.manualTotal !== 0 && (
+                          <span style={{color:ado.manualTotal>0?"#a5d6a7":"#ef9a9a",fontWeight:700,fontSize:12}}>
+                            {ado.manualTotal>0?"+":""}{ado.manualTotal}
+                          </span>
+                        )}
+                        {ado.adjustments.length===0&&<span style={{color:"#2a5070",fontSize:11}}>—</span>}
+                      </td>
+                      <td style={{...C.td,padding:"10px 14px"}}>
+                        <span style={{
+                          fontSize:15,fontWeight:700,color:balColor(bal),
+                          background:balColor(bal)+"22",borderRadius:8,
+                          padding:"3px 12px",display:"inline-block"
+                        }}>
+                          {bal} ADO{bal!==1?"s":""}
+                        </span>
+                      </td>
+                      <td style={{...C.td,padding:"8px 14px"}}>
+                        <button style={{...C.btnSec,fontSize:10,padding:"4px 10px",color:"#a5d6a7",borderColor:"#2e7d32"}}
+                          onClick={()=>{setEditingId(s.id);setAdjValue(0);setAdjNote("");}}>
+                          + Adjustment
+                        </button>
+                      </td>
+                    </tr>
+
+                    {/* Roster breakdown detail */}
+                    {isOpen && (
+                      <tr key={s.id+"_detail"} style={{background:"#060d18"}}>
+                        <td colSpan={7} style={{padding:"0 14px 12px 32px"}}>
+                          <div style={{fontSize:11,color:"#4a7fa0",marginBottom:6,marginTop:8}}>ADOs auto-inserted by roster generator:</div>
+                          {ado.rosterBreakdown.map(rb=>(
+                            <div key={rb.key} style={{display:"flex",gap:12,alignItems:"center",marginBottom:4,flexWrap:"wrap"}}>
+                              <span style={{color:"#64b5f6",fontWeight:600,minWidth:90}}>{fmtDate(rb.startDate)}</span>
+                              <span style={{color:"#7fb3d3"}}>{rb.weeks===2?"Fortnight":"4 weeks"}</span>
+                              <span style={{color:"#a5d6a7",fontWeight:700}}>{rb.count} ADO{rb.count!==1?"s":""}</span>
+                              <span style={{color:"#2a5070",fontSize:10}}>{rb.dates.map(d=>fmtDate(d)).join(", ")}</span>
+                              {rb.locked&&<span style={C.bdg("#4a2000","#f39c12")}>🔒 Locked</span>}
+                            </div>
+                          ))}
+                          {/* Manual adjustments */}
+                          {ado.adjustments.length>0&&(
+                            <>
+                              <div style={{fontSize:11,color:"#4a7fa0",marginTop:10,marginBottom:6}}>Manual adjustments:</div>
+                              {ado.adjustments.map(adj=>(
+                                <div key={adj.id} style={{display:"flex",gap:12,alignItems:"center",marginBottom:4,background:"#0a1525",borderRadius:6,padding:"5px 10px",flexWrap:"wrap"}}>
+                                  <span style={{color:"#64b5f6",minWidth:90}}>{fmtDate(adj.date)}</span>
+                                  <span style={{color:adj.value>0?"#a5d6a7":"#ef9a9a",fontWeight:700}}>
+                                    {adj.value>0?"+":""}{adj.value} ADO{Math.abs(adj.value)!==1?"s":""}
+                                  </span>
+                                  <span style={{color:"#7fb3d3",flex:1}}>{adj.note}</span>
+                                  <button style={{background:"none",border:"none",color:"#ef5350",cursor:"pointer",fontSize:13}}
+                                    onClick={()=>removeAdjustment(s.id,adj.id)}>✕</button>
+                                </div>
+                              ))}
+                            </>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Summary stats */}
+      {eligibleStaff.length > 0 && (
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:12,marginBottom:24}}>
+          {[
+            ["Total ADOs Rostered", eligibleStaff.reduce((s,x)=>s+computeADO(x.id).autoTotal,0), "#a5d6a7"],
+            ["Manual Adjustments",  eligibleStaff.reduce((s,x)=>s+computeADO(x.id).adjustments.length,0), "#90caf9"],
+            ["Staff with Balance>0",eligibleStaff.filter(x=>computeADO(x.id).balance>0).length, "#66bb6a"],
+            ["Staff with Balance=0",eligibleStaff.filter(x=>computeADO(x.id).balance===0).length, "#4a7fa0"],
+          ].map(([l,v,col])=>(
+            <div key={l} style={{background:"#0a1828",border:"1px solid #1a3050",borderRadius:8,padding:"12px 16px",textAlign:"center"}}>
+              <div style={{fontSize:24,fontWeight:700,color:col}}>{v}</div>
+              <div style={{fontSize:10,color:"#4a7fa0",marginTop:4}}>{l}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Adjustment modal */}
+      {editingId && (()=>{
+        const s = staff.find(x=>x.id===editingId);
+        const ado = computeADO(editingId);
+        return(
+          <div style={{position:"fixed",inset:0,background:"#000000aa",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}}
+            onClick={()=>setEditingId(null)}>
+            <div style={{background:"#0a1828",border:"1px solid #1a3050",borderRadius:12,padding:28,minWidth:340,maxWidth:420}}
+              onClick={e=>e.stopPropagation()}>
+              <h3 style={{color:"#4fc3f7",fontSize:15,fontWeight:700,marginBottom:4}}>ADO Adjustment</h3>
+              <div style={{color:"#7fb3d3",fontSize:12,marginBottom:16}}>{s?.name} — current balance: <b style={{color:balColor(ado.balance)}}>{ado.balance} ADO{ado.balance!==1?"s":""}</b></div>
+
+              <label style={C.lbl}>Adjustment (+/−)</label>
+              <div style={{display:"flex",gap:8,marginBottom:10}}>
+                {[-3,-2,-1,1,2,3].map(v=>(
+                  <button key={v} onClick={()=>setAdjValue(v)} style={{
+                    flex:1,padding:"8px 0",borderRadius:7,fontFamily:"inherit",fontWeight:700,fontSize:13,cursor:"pointer",
+                    background:adjValue===v?(v>0?"#1b5e20":"#7f0000"):"#0f1e35",
+                    color:adjValue===v?"#fff":(v>0?"#a5d6a7":"#ef9a9a"),
+                    border:`1px solid ${adjValue===v?(v>0?"#27ae60":"#ef5350"):"#1a3050"}`,
+                  }}>{v>0?"+":""}{v}</button>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:8,marginBottom:10}}>
+                <input type="number" style={{...C.inp,marginBottom:0,flex:1}} placeholder="Or enter custom value…"
+                  value={adjValue||""} onChange={e=>setAdjValue(Number(e.target.value))}/>
+              </div>
+
+              <label style={C.lbl}>Reason / Note</label>
+              <input type="text" style={C.inp} placeholder="e.g. ADO taken 12 Jun not recorded in roster"
+                value={adjNote} onChange={e=>setAdjNote(e.target.value)}/>
+
+              <div style={{background:"#060d18",borderRadius:6,padding:"8px 12px",marginBottom:16,fontSize:11,color:"#4a7fa0"}}>
+                New balance will be: <b style={{color:balColor(ado.balance+adjValue)}}>{ado.balance+adjValue} ADO{(ado.balance+adjValue)!==1?"s":""}</b>
+              </div>
+
+              <div style={{display:"flex",gap:10}}>
+                <button style={{...C.btnPrimary,flex:1}} onClick={addAdjustment}>Save Adjustment</button>
+                <button style={C.btnSec} onClick={()=>setEditingId(null)}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+// ─── HISTORY TAB ─────────────────────────────────────────────
+function HistoryTab({ rosters, staff, activeKey, setActiveKey, setTab, onDelete }) {
+  const [compareA, setCompareA] = useState(null);
+  const [compareB, setCompareB] = useState(null);
+  const [mode, setMode]         = useState("list");
+
+  const sortedKeys = Object.keys(rosters).sort().reverse();
+
+  function openRoster(key) { setActiveKey(key); setTab("roster"); }
+
+  function rosterStats(key) {
+    const r = rosters[key]; if (!r) return null;
+    const days = r.days || [], warnings = r.warnings || [];
+    const hs = r.hoursSummary || {};
+    const onTarget  = Object.values(hs).filter(h=>Math.abs(h.variance||0)<=8).length;
+    const offTarget = Object.values(hs).filter(h=>Math.abs(h.variance||0)>8).length;
+    const totalShifts = days.reduce((acc,d)=>acc+(r.roster[d]?.D?.length||0)+(r.roster[d]?.E?.length||0)+(r.roster[d]?.N?.length||0),0);
+    return { days:days.length, warnings, onTarget, offTarget, totalShifts,
+             adoTotal:r.adoTotal||0, locked:r.locked, lockedAt:r.lockedAt,
+             generatedAt:r.generatedAt, weeks:r.weeks||2, startDate:r.startDate };
+  }
+
+  function ComparePanel({ keyA, keyB }) {
+    const rA=rosters[keyA], rB=rosters[keyB];
+    if (!rA||!rB) return null;
+    const sA=rosterStats(keyA), sB=rosterStats(keyB);
+    const rows=[
+      ["Period",           `${fmtDate(sA.startDate)} (${sA.weeks}w)`,`${fmtDate(sB.startDate)} (${sB.weeks}w)`],
+      ["Total days",       sA.days,          sB.days],
+      ["Total warnings",   sA.warnings.length,sB.warnings.length],
+      ["Staffing issues",  sA.warnings.filter(w=>w.type==="staffing").length, sB.warnings.filter(w=>w.type==="staffing").length],
+      ["In-charge issues", sA.warnings.filter(w=>w.type==="incharge").length, sB.warnings.filter(w=>w.type==="incharge").length],
+      ["Hours issues",     sA.warnings.filter(w=>w.type==="hours").length,    sB.warnings.filter(w=>w.type==="hours").length],
+      ["Staff on target",  sA.onTarget,      sB.onTarget],
+      ["Staff off target", sA.offTarget,     sB.offTarget],
+      ["ADOs inserted",    sA.adoTotal,      sB.adoTotal],
+      ["Status",           sA.locked?"🔒 Locked":"✏️ Draft", sB.locked?"🔒 Locked":"✏️ Draft"],
+    ];
+    const staffToShow = staff.filter(s=>!s.resigned).slice(0,30);
+    return (
+      <div>
+        <h3 style={{...C.sectionH,marginBottom:16}}>Roster Comparison</h3>
+        <div style={{border:"1px solid #1a3050",borderRadius:8,overflow:"hidden",marginBottom:24}}>
+          <table style={{borderCollapse:"collapse",width:"100%"}}>
+            <thead>
+              <tr style={{background:"#060e18"}}>
+                <th style={{...C.th,textAlign:"left",padding:"10px 14px",minWidth:160}}>Metric</th>
+                <th style={{...C.th,padding:"10px 14px",color:"#64b5f6",minWidth:180}}>{keyA}</th>
+                <th style={{...C.th,padding:"10px 14px",color:"#ffa726",minWidth:180}}>{keyB}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(([label,vA,vB],i)=>{
+                const diff=String(vA)!==String(vB);
+                return (
+                  <tr key={label} style={{background:i%2===0?"#0a1828":"#07101e",borderTop:"1px solid #0d1e30"}}>
+                    <td style={{...C.td,padding:"9px 14px",color:"#7fb3d3",fontWeight:600}}>{label}</td>
+                    <td style={{...C.td,padding:"9px 14px",textAlign:"center",color:diff?"#64b5f6":"#a8dadc",fontWeight:diff?700:400}}>{vA}</td>
+                    <td style={{...C.td,padding:"9px 14px",textAlign:"center",color:diff?"#ffa726":"#a8dadc",fontWeight:diff?700:400}}>{vB}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <h3 style={{...C.sectionH,marginBottom:12}}>Hours Comparison — per staff member</h3>
+        <div style={{border:"1px solid #1a3050",borderRadius:8,overflow:"hidden"}}>
+          <table style={{borderCollapse:"collapse",width:"100%"}}>
+            <thead>
+              <tr style={{background:"#060e18"}}>
+                <th style={{...C.th,textAlign:"left",padding:"9px 14px"}}>Staff</th>
+                <th style={{...C.th,padding:"9px 14px",color:"#4a7fa0"}}>Contract</th>
+                <th style={{...C.th,padding:"9px 14px",color:"#64b5f6"}}>{keyA}</th>
+                <th style={{...C.th,padding:"9px 14px",color:"#ffa726"}}>{keyB}</th>
+                <th style={{...C.th,padding:"9px 14px"}}>Diff</th>
+              </tr>
+            </thead>
+            <tbody>
+              {staffToShow.map((s,i)=>{
+                const wA=rA.hoursSummary?.[s.id]?.worked??"—";
+                const wB=rB.hoursSummary?.[s.id]?.worked??"—";
+                const diff=(typeof wA==="number"&&typeof wB==="number")?wB-wA:null;
+                const cls=CLASSIFICATIONS[s.cls];
+                return (
+                  <tr key={s.id} style={{background:i%2===0?"#0a1828":"#07101e",borderTop:"1px solid #0d1e30"}}>
+                    <td style={{...C.td,padding:"7px 14px"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <span style={{width:7,height:7,borderRadius:"50%",background:cls?.color,flexShrink:0}}/>
+                        <span style={{fontSize:11,color:"#c8d8e8"}}>{s.name}</span>
+                      </div>
+                    </td>
+                    <td style={{...C.td,padding:"7px 14px",textAlign:"center",color:"#4a7fa0",fontSize:11}}>{s.hrs}h</td>
+                    <td style={{...C.td,padding:"7px 14px",textAlign:"center",color:"#64b5f6",fontWeight:600}}>{wA}{typeof wA==="number"?"h":""}</td>
+                    <td style={{...C.td,padding:"7px 14px",textAlign:"center",color:"#ffa726",fontWeight:600}}>{wB}{typeof wB==="number"?"h":""}</td>
+                    <td style={{...C.td,padding:"7px 14px",textAlign:"center"}}>
+                      {diff!==null&&diff!==0&&<span style={{color:diff>0?"#ffa726":"#64b5f6",fontWeight:700,fontSize:11}}>{diff>0?"+":""}{diff}h</span>}
+                      {diff===0&&<span style={{color:"#2a5070",fontSize:10}}>same</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+              {staff.filter(s=>!s.resigned).length>30&&(
+                <tr><td colSpan={5} style={{...C.td,padding:"8px 14px",color:"#2a5070",fontSize:11,textAlign:"center"}}>Showing first 30 staff</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={C.toolbar}>
+        <h2 style={C.pageH}>🕐 Roster History</h2>
+        <div style={{display:"flex",gap:8}}>
+          <button style={{...C.selBtn,...(mode==="list"?C.selBtnOn:{})}} onClick={()=>setMode("list")}>📋 All Rosters</button>
+          <button style={{...C.selBtn,...(mode==="compare"?C.selBtnOn:{})}} onClick={()=>setMode("compare")}>⚖️ Compare Two</button>
+        </div>
+      </div>
+
+      {sortedKeys.length===0&&(
+        <div style={C.empty}>
+          <div style={{fontSize:48,marginBottom:12}}>🕐</div>
+          <div style={C.emptyH}>No Roster History</div>
+          <div style={C.emptySub}>Generated rosters will appear here. Go to ⚡ Generate to build your first roster.</div>
+        </div>
+      )}
+
+      {/* LIST MODE */}
+      {mode==="list"&&sortedKeys.length>0&&(
+        <div>
+          <div style={{fontSize:11,color:"#4a7fa0",marginBottom:16}}>
+            {sortedKeys.length} roster{sortedKeys.length!==1?"s":""} saved.
+            Click <b style={{color:"#64b5f6"}}>Open →</b> to view in the Roster tab.
+            <b style={{color:"#ef5350"}}> Deleting is permanent and cannot be undone.</b>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {sortedKeys.map(key=>{
+              const s=rosterStats(key); if(!s)return null;
+              const isActive=key===activeKey;
+              const warnCount=s.warnings.length;
+              const warnCol=warnCount===0?"#66bb6a":warnCount<5?"#ffa726":"#ef5350";
+              return (
+                <div key={key} style={{
+                  background:isActive?"#0d2035":"#0a1828",
+                  border:`1px solid ${isActive?"#1565c0":"#112a42"}`,
+                  borderRadius:10,padding:"16px 18px",
+                  display:"flex",alignItems:"center",gap:16,flexWrap:"wrap",
+                }}>
+                  <div style={{flexShrink:0,textAlign:"center",minWidth:48}}>
+                    <div style={{fontSize:22}}>{s.locked?"🔒":"✏️"}</div>
+                    <div style={{fontSize:9,color:s.locked?"#f39c12":"#66bb6a",marginTop:2,fontWeight:700}}>
+                      {s.locked?"Locked":"Draft"}
+                    </div>
+                  </div>
+                  <div style={{flex:1,minWidth:200}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                      <span style={{fontSize:14,fontWeight:700,color:isActive?"#64b5f6":"#c8d8e8"}}>{key}</span>
+                      {isActive&&<span style={{fontSize:9,background:"#1565c0",color:"#90caf9",borderRadius:6,padding:"1px 7px",fontWeight:700}}>CURRENT</span>}
+                    </div>
+                    <div style={{display:"flex",gap:14,flexWrap:"wrap",fontSize:11,color:"#4a7fa0"}}>
+                      <span>📅 {s.days} days ({s.weeks===2?"1 fortnight":"4 weeks"})</span>
+                      <span style={{color:warnCol}}>⚠ {warnCount} warning{warnCount!==1?"s":""}</span>
+                      <span style={{color:"#a5d6a7"}}>🗓 {s.adoTotal} ADO{s.adoTotal!==1?"s":""}</span>
+                      {s.offTarget>0&&<span style={{color:"#ffa726"}}>⏱ {s.offTarget} off-target</span>}
+                    </div>
+                    <div style={{display:"flex",gap:14,flexWrap:"wrap",fontSize:10,color:"#2a5070",marginTop:3}}>
+                      {s.generatedAt&&<span>Generated: {fmtDate(s.generatedAt)}</span>}
+                      {s.locked&&s.lockedAt&&<span>Locked: {fmtDate(s.lockedAt)}</span>}
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                    {s.warnings.filter(w=>w.type==="staffing").length>0&&<span style={{...C.warnBadge,background:"#4a2000",fontSize:10}}>👥 {s.warnings.filter(w=>w.type==="staffing").length}</span>}
+                    {s.warnings.filter(w=>w.type==="incharge").length>0&&<span style={{...C.warnBadge,background:"#3a0030",fontSize:10}}>⭐ {s.warnings.filter(w=>w.type==="incharge").length}</span>}
+                    {s.warnings.filter(w=>w.type==="hours").length>0&&<span style={{...C.warnBadge,background:"#003030",fontSize:10}}>⏱ {s.warnings.filter(w=>w.type==="hours").length}</span>}
+                  </div>
+                  <div style={{display:"flex",gap:8,flexShrink:0}}>
+                    <button style={{...C.btnPrimary,fontSize:11,padding:"6px 14px"}} onClick={()=>openRoster(key)}>Open →</button>
+                    <button style={{...C.btnSec,fontSize:11,padding:"6px 14px",color:"#ef5350",borderColor:"#7f000066"}} onClick={()=>onDelete(key)}>🗑 Delete</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* COMPARE MODE */}
+      {mode==="compare"&&(
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:24}}>
+            {[["A","#64b5f6",compareA,setCompareA],["B","#ffa726",compareB,setCompareB]].map(([lbl,col,val,setter])=>(
+              <div key={lbl} style={C.card}>
+                <div style={{...C.cardH,color:col}}>Roster {lbl}</div>
+                <label style={C.lbl}>Select roster</label>
+                <select style={C.inp} value={val||""} onChange={e=>setter(e.target.value||null)}>
+                  <option value="">— Select —</option>
+                  {sortedKeys.map(k=><option key={k} value={k}>{k}{rosters[k]?.locked?" 🔒":""}</option>)}
+                </select>
+                {val&&rosterStats(val)&&(
+                  <div style={{fontSize:11,color:"#4a7fa0",marginTop:4}}>
+                    {rosterStats(val).days} days · {rosterStats(val).warnings.length} warnings · {rosterStats(val).locked?"🔒 Locked":"✏️ Draft"}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          {compareA&&compareB&&compareA!==compareB
+            ?<ComparePanel keyA={compareA} keyB={compareB}/>
+            :compareA&&compareB&&compareA===compareB
+              ?<div style={{color:"#ef5350",fontSize:12,padding:12}}>Select two different rosters to compare.</div>
+              :<div style={{color:"#2a5070",fontSize:12,padding:12}}>Select a roster for both A and B above.</div>
+          }
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── STYLES ──────────────────────────────────────────────────
-const C = {
-  app:       {minHeight:"100vh",background:"#06101a",color:"#c8d8e8",fontFamily:"'DM Mono','Courier New',monospace",fontSize:13},
+const C = {       {minHeight:"100vh",background:"#06101a",color:"#c8d8e8",fontFamily:"'DM Mono','Courier New',monospace",fontSize:13},
   header:    {display:"flex",alignItems:"center",gap:16,padding:"10px 22px",background:"#04090f",borderBottom:"1px solid #112030",flexWrap:"wrap"},
   brand:     {display:"flex",alignItems:"center",gap:10,marginRight:6},
   brandTitle:{fontSize:16,fontWeight:700,color:"#4fc3f7",letterSpacing:2,textTransform:"uppercase"},
