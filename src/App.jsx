@@ -111,6 +111,12 @@ function buildLeaveMap(staff) {
   return lm;
 }
 
+function nightAdjustedHrs(s) {
+  // Hours a staff member can contribute to nights per fortnight block
+  // Nights are 10h shifts — round down contracted hours to nearest 10h multiple
+  return Math.floor(s.hrs / 10) * 10;
+}
+
 function autoComputeNightGroups(staff) {
   const eligible = staff.filter(s =>
     !s.permNights && s.cls!=="NUM" &&
@@ -118,42 +124,87 @@ function autoComputeNightGroups(staff) {
       (c.type==="SPECIFIC_SHIFTS" && c.shifts && !c.shifts.includes("N")))
   );
   const permNights     = staff.filter(s=>s.permNights);
-  const permHoursPerFn = permNights.reduce((a,s)=>a+s.hrs,0);
-  const rotNeeded      = Math.max(0, 700-permHoursPerFn);
-  const avgHrs         = eligible.length ? eligible.reduce((a,s)=>a+s.hrs,0)/eligible.length : 80;
-  const staffPerBlock  = Math.max(1,Math.ceil(rotNeeded/avgHrs));
-  const numGroups      = Math.max(2,Math.ceil(eligible.length/staffPerBlock));
-  const clsPri         = {ANUM:0,CNS:1,RN:2,GNP:3,EN:4};
-  const sorted         = [...eligible].sort((a,b)=>{
+  // Perm nights also contribute night-adjusted hours
+  const permHoursPerFn = permNights.reduce((a,s)=>a+nightAdjustedHrs(s),0);
+
+  // Base requirement: 5 staff × 10h × 14 nights = 700h per fortnight block
+  // With 25% buffer: 700 × 1.25 = 875h target
+  const BASE_REQUIRED  = 700;
+  const BUFFER         = 1.25;
+  const TARGET_HOURS   = BASE_REQUIRED * BUFFER; // 875h
+  const rotNeeded      = Math.max(0, TARGET_HOURS - permHoursPerFn);
+
+  // Each eligible staff contributes their night-adjusted hours per block
+  const avgNightHrs    = eligible.length
+    ? eligible.reduce((a,s)=>a+nightAdjustedHrs(s),0) / eligible.length
+    : 70;
+
+  // How many staff per block needed to hit the buffered target
+  const staffPerBlock  = Math.max(1, Math.ceil(rotNeeded / avgNightHrs));
+
+  // Number of groups = total eligible / staff per block
+  // Fewer groups = each group is on nights more frequently (aim for 6-8wk gap)
+  const numGroups      = Math.max(2, Math.ceil(eligible.length / staffPerBlock));
+
+  // Sort: ensure each group has in-charge coverage, then by classification priority, then hrs desc
+  const clsPri = {ANUM:0,CNS:1,RN:2,GNP:3,EN:4};
+  const sorted  = [...eligible].sort((a,b)=>{
     const cp=(clsPri[a.cls]||5)-(clsPri[b.cls]||5); if(cp!==0)return cp;
     return b.hrs-a.hrs;
   });
-  const groups = Array.from({length:numGroups},(_,i)=>({id:i+1,members:[],totalHours:0}));
-  sorted.forEach((s,i)=>{ const g=groups[i%numGroups]; g.members.push(s.id); g.totalHours+=s.hrs; });
-  return { groups, numGroups, staffPerBlock, permHoursPerFn };
+
+  const groups = Array.from({length:numGroups},(_,i)=>({
+    id:i+1, members:[], totalHours:0, nightHours:0
+  }));
+
+  // Round-robin assignment
+  sorted.forEach((s,i)=>{
+    const g=groups[i%numGroups];
+    g.members.push(s.id);
+    g.totalHours  += s.hrs;
+    g.nightHours  += nightAdjustedHrs(s);
+  });
+
+  return { groups, numGroups, staffPerBlock, permHoursPerFn,
+           targetHours:TARGET_HOURS, baseRequired:BASE_REQUIRED, bufferPct:25 };
 }
 
-function autoAssignNightPlan(staff,year) {
+function autoAssignNightPlan(staff, year, firstMonday) {
   const {groups}=autoComputeNightGroups(staff);
   const plan={}, groupAssignments={};
-  const startOfYear=getMon(new Date(year,0,1));
+
+  // Use the provided first Monday, or fall back to first Monday of the year
+  const startMon = firstMonday ? getMon(new Date(firstMonday)) : getMon(new Date(year,0,1));
+
+  // Build 26 fortnights from that start date
   const fns=Array.from({length:26},(_,i)=>({
-    idx:i, start:addDays(startOfYear,i*14), end:addDays(startOfYear,i*14+13),
-    key:isoDate(addDays(startOfYear,i*14))
+    idx:i,
+    start: addDays(startMon, i*14),
+    end:   addDays(startMon, i*14+13),
+    key:   isoDate(addDays(startMon, i*14)),
   }));
+
+  // Assign groups to fortnights with max gap between reuse (6-8 week / 3-4 fn gap)
   const lastUsed={};
   fns.forEach((fn,i)=>{
     let best=null,bestGap=-1;
     groups.forEach(g=>{ const gap=i-(lastUsed[g.id]??-99); if(gap>bestGap){bestGap=gap;best=g;} });
     groupAssignments[fn.key]=best.id; lastUsed[best.id]=i;
   });
+
+  // Build per-staff plan from group assignments
   fns.forEach(fn=>{
     const group=groups.find(g=>g.id===groupAssignments[fn.key]); if(!group)return;
     group.members.forEach(sid=>{
-      for(let d=0;d<14;d++){ const iso=isoDate(addDays(fn.start,d)); if(!plan[sid])plan[sid]={}; plan[sid][iso]=true; }
+      for(let d=0;d<14;d++){
+        const iso=isoDate(addDays(fn.start,d));
+        if(!plan[sid])plan[sid]={};
+        plan[sid][iso]=true;
+      }
     });
   });
-  return {plan,groupAssignments,groups,fns};
+
+  return {plan, groupAssignments, groups, fns, firstMonday: isoDate(startMon), year};
 }
 
 const SAMPLE_STAFF = [
@@ -313,27 +364,74 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   const maxGNPShift=Math.max(1,Math.floor(totalGNP/2));
   let numHasWorked=false;
 
+  // Track staff redirected from nights to D/E (for warnings)
+  const redirectedFromNights = []; // { staffId, name, reason }
+
   // Helper: recompute remaining shifts for a staff member at any point in time
-  // Used after ADO insertions update hw mid-generation
   function remainingShifts(s) {
     const shiftHrs = s.permNights ? 10 : 8;
     const hrsLeft = Math.max(0, periodTarget[s.id] - hw[s.id]);
     return Math.floor(hrsLeft / shiftHrs);
   }
 
-  // canWork checks remaining shifts dynamically (not cached maxShifts)
-  // so it stays accurate after ADO insertions change hw mid-run
-
   // ── PHASE 1: Night shifts ─────────────────────────────────
+  // Hard cap: 5 per night shift. If more staff are in the night plan
+  // than needed, excess staff are flagged and moved to D/E automatically.
+  // Track per-staff: did they exceed their night hours ceiling this period?
+  const nightHoursCeiling = {}; // staffId -> max night hours this period
+  staff.forEach(s => {
+    if (s.permNights) {
+      nightHoursCeiling[s.id] = periodTarget[s.id]; // perm: use full target
+    } else {
+      // Rotating: night-adjusted hours = floor(hrs/10)*10 per fortnight
+      nightHoursCeiling[s.id] = Math.floor((s.hrs * (weeks/2)) / 10) * 10;
+    }
+  });
+
+  // Track night hours assigned per staff this period
+  const nightHrsAssigned = {};
+  staff.forEach(s => { nightHrsAssigned[s.id] = 0; });
+
   days.forEach(({iso}) => {
     const eligible = staff.filter(s => canWork(s,iso,"N")).sort((a,b) => {
       if (a.permNights && !b.permNights) return -1;
       if (!a.permNights && b.permNights) return  1;
       return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
     });
+
     let enCnt=0, gnpCnt=0, anumCnt=0, icOk=false;
+    const redirectThisNight = [];
+
     for (const s of eligible) {
-      if (roster[iso].N.length >= 5) break;
+      // Hard cap: max 5 on nights
+      if (roster[iso].N.length >= 5) {
+        // This person was in the night plan but can't fit — redirect to D/E
+        if (!s.permNights && nightPlanData?.plan?.[s.id]?.[iso]) {
+          const alreadyRedirected = redirectedFromNights.some(r=>r.staffId===s.id);
+          if (!alreadyRedirected) {
+            redirectedFromNights.push({
+              staffId: s.id,
+              name:    s.name,
+              reason:  `Night shift full (5/5) on ${iso} — moved to Day/Evening shifts`,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Check night hours ceiling for this period
+      if (!s.permNights && nightHrsAssigned[s.id] + 10 > nightHoursCeiling[s.id]) {
+        // Would exceed their night hours allocation — redirect
+        if (!redirectedFromNights.some(r=>r.staffId===s.id)) {
+          redirectedFromNights.push({
+            staffId: s.id,
+            name:    s.name,
+            reason:  `Night hours ceiling reached (${nightHoursCeiling[s.id]}h) — moved to Day/Evening shifts`,
+          });
+        }
+        continue;
+      }
+
       if (s.cls==="EN"  && enCnt  >= 1) continue;
       if (s.cls==="GNP" && gnpCnt >= 1) continue;
       if (s.cls==="ANUM") {
@@ -348,14 +446,16 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       roster[iso].N.push(s.id);
       hw[s.id] += 10;
       shiftCount[s.id]++;
+      nightHrsAssigned[s.id] += 10;
       if (isInCharge(s)) icOk = true;
     }
     // In-charge fallback — must pass canWork
     if (!icOk && roster[iso].N.length > 0) {
       const ic = eligible.find(s =>
-        !roster[iso].N.includes(s.id) && isInCharge(s) && canWork(s,iso,"N")
+        !roster[iso].N.includes(s.id) && isInCharge(s) && canWork(s,iso,"N") &&
+        nightHrsAssigned[s.id] + 10 <= nightHoursCeiling[s.id]
       );
-      if (ic) { roster[iso].N.push(ic.id); hw[ic.id]+=10; shiftCount[ic.id]++; }
+      if (ic) { roster[iso].N.push(ic.id); hw[ic.id]+=10; shiftCount[ic.id]++; nightHrsAssigned[ic.id]+=10; }
     }
   });
 
@@ -400,10 +500,12 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     const BASE = wknd ? 9 : 10;
     const isNUMSlot = shift==="D" && di>=1 && di<=3 && !numHasWorked;
 
+    const redirectedIds = new Set(redirectedFromNights.map(r=>r.staffId));
     const eligible = staff.filter(s => {
       if (s.permNights) return false;
-      if (nightPlanData?.plan?.[s.id]?.[iso]) return false;
-      return canWork(s, iso, shift); // canWork uses dynamic remainingShifts check
+      // Night plan staff can't work D/E — UNLESS they were redirected due to night cap
+      if (nightPlanData?.plan?.[s.id]?.[iso] && !redirectedIds.has(s.id)) return false;
+      return canWork(s, iso, shift);
     }).sort((a,b) => {
       const aReq = !!(a.requests?.[`${iso}_${shift}`]);
       const bReq = !!(b.requests?.[`${iso}_${shift}`]);
@@ -544,6 +646,12 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     });
   });
 
+  // Redirected-from-nights warnings
+  redirectedFromNights.forEach(r=>{
+    warnings.push({iso:"—",sh:"N→DE",type:"redirected",msg:`${r.name}: ${r.reason}`});
+  });
+
+  // Hours variance warnings
   staff.forEach(s=>{
     const v=hoursSummary[s.id];
     if(Math.abs(v.variance)>8)warnings.push({iso:"—",sh:"Hrs",type:"hours",msg:`${s.name}: ${v.worked}h worked vs ${v.target}h target (${v.variance>0?"+":""}${v.variance}h)`});
@@ -992,7 +1100,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
   );
 
   const days=roster.days||[];
-  const wBT={staffing:0,incharge:0,hours:0,isolated:0};
+  const wBT={staffing:0,incharge:0,hours:0,isolated:0,redirected:0};
   (roster.warnings||[]).forEach(w=>{ wBT[w.type]=(wBT[w.type]||0)+1; });
 
   return(
@@ -1021,6 +1129,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
             {wBT.incharge>0&&<span style={{...C.warnBadge,background:"#3a0030"}}>⭐ {wBT.incharge} in-charge</span>}
             {wBT.hours>0&&<span style={{...C.warnBadge,background:"#003030"}}>⏱ {wBT.hours} hours</span>}
             {wBT.isolated>0&&<span style={{...C.warnBadge,background:"#3a2a00"}}>⚠ {wBT.isolated} isolated</span>}
+            {wBT.redirected>0&&<span style={{...C.warnBadge,background:"#002040"}}>🔀 {wBT.redirected} redirected</span>}
           </div>
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -1234,14 +1343,15 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
         <div>
           <h3 style={C.sectionH}>Scheduling Warnings — {(roster.warnings||[]).length} total</h3>
           {(roster.warnings||[]).length===0&&<div style={{color:"#2a5070",padding:16}}>✅ No warnings — roster looks good.</div>}
-          {["staffing","incharge","hours","isolated"].map(type=>{
+          {["staffing","incharge","hours","isolated","redirected"].map(type=>{
             const items=(roster.warnings||[]).filter(w=>w.type===type);
             if(!items.length)return null;
             const meta={
-              staffing:{title:"Staffing Levels",    icon:"👥",color:"#ffa726"},
-              incharge:{title:"In-Charge Coverage", icon:"⭐",color:"#ce93d8"},
-              hours:   {title:"Hours Variance",     icon:"⏱",color:"#80deea"},
-              isolated:{title:"Isolated Shifts",    icon:"⚠",color:"#ffa726"},
+              staffing:  {title:"Staffing Levels",          icon:"👥",color:"#ffa726"},
+              incharge:  {title:"In-Charge Coverage",       icon:"⭐",color:"#ce93d8"},
+              hours:     {title:"Hours Variance",           icon:"⏱",color:"#80deea"},
+              isolated:  {title:"Isolated Shifts",          icon:"⚠",color:"#ffa726"},
+              redirected:{title:"Redirected from Nights",   icon:"🔀",color:"#64b5f6"},
             };
             const m=meta[type];
             return(
@@ -1937,17 +2047,32 @@ function LeaveTab({staff,setStaff,toast}){
 
 // ─── NIGHT PLAN TAB ──────────────────────────────────────────
 function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
-  const [year,setYear]=useState(new Date().getFullYear());
-  const [view,setView]=useState("planner"); // "planner" | "timeline"
-  const {groups,numGroups,staffPerBlock,permHoursPerFn}=autoComputeNightGroups(staff);
+  const [year,setYear]             = useState(new Date().getFullYear());
+  const [view,setView]             = useState("planner");
+  const [firstMonday,setFirstMonday] = useState(
+    // Default: first Monday of current year, or stored from previous plan
+    ()=> nightPlanData?.firstMonday || isoDate(getMon(new Date(new Date().getFullYear(),0,1)))
+  );
+  const {groups,numGroups,staffPerBlock,permHoursPerFn,targetHours,baseRequired,bufferPct}=autoComputeNightGroups(staff);
   const permStaff=staff.filter(s=>s.permNights);
   const gc=["#e53935","#fb8c00","#fdd835","#43a047","#1e88e5","#8e24aa","#00acc1","#f06292","#00897b","#6d4c41"];
 
+  // Validate firstMonday is actually a Monday
+  const firstMondayValid = firstMonday && new Date(firstMonday).getDay() === 1;
+
   function autoGen(){
-    const result=autoAssignNightPlan(staff,year);
+    if(!firstMondayValid){
+      toast("First Monday must be a Monday — please check the date","err"); return;
+    }
+    const result=autoAssignNightPlan(staff, year, firstMonday);
     setNightPlanData(result);
-    toast(`Night plan generated for ${year}: ${result.groups.length} groups`);
+    toast(`Night plan generated for ${year}: ${result.groups.length} groups, starting ${fmtDate(firstMonday)}`);
   }
+
+  // Keep firstMonday in sync with stored plan
+  useEffect(()=>{
+    if(nightPlanData?.firstMonday) setFirstMonday(nightPlanData.firstMonday);
+  },[nightPlanData]);
 
   // Build fortnight list for selected year
   const yearFns = (nightPlanData?.fns||[]).filter(fn=>new Date(fn.start).getFullYear()===year);
@@ -1970,11 +2095,15 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
               <div style={C.cardH}>Coverage Calculation</div>
               <div style={{fontSize:11,color:"#7fb3d3",lineHeight:2.1}}>
                 <div>Required: <b style={{color:"#a8dadc"}}>5 staff × 10h = 50h/shift</b></div>
-                <div>14 nights/block: <b style={{color:"#a8dadc"}}>700h total</b></div>
-                <div>Perm nights: <b style={{color:"#a8dadc"}}>{permHoursPerFn}h/fn</b></div>
-                <div>Rotating needed: <b style={{color:"#a8dadc"}}>{Math.max(0,700-permHoursPerFn)}h/block</b></div>
+                <div>14 nights/block: <b style={{color:"#a8dadc"}}>{baseRequired}h base target</b></div>
+                <div>+{bufferPct}% buffer: <b style={{color:"#66bb6a"}}>{targetHours}h target</b></div>
+                <div>Perm nights (adj.): <b style={{color:"#a8dadc"}}>{permHoursPerFn}h/fn</b></div>
+                <div>Rotating needed: <b style={{color:"#a8dadc"}}>{Math.max(0,targetHours-permHoursPerFn)}h/block</b></div>
                 <div>Staff per block: <b style={{color:"#66bb6a"}}>{staffPerBlock}</b></div>
                 <div>Groups: <b style={{color:"#66bb6a"}}>{numGroups}</b></div>
+                <div style={{fontSize:9,color:"#2a6080",marginTop:4}}>
+                  Hours rounded down to nearest 10h (night shift length)
+                </div>
               </div>
             </div>
             <div style={C.card}>
@@ -1991,14 +2120,41 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
             </div>
             <div style={C.card}>
               <div style={C.cardH}>Auto-Generate Plan</div>
-              <div style={{fontSize:11,color:"#4a7fa0",marginBottom:12,lineHeight:1.7}}>Groups staff by classification and hours, ensures In-Charge coverage, rotates with 6–8 week gaps.</div>
+              <div style={{fontSize:11,color:"#4a7fa0",marginBottom:10,lineHeight:1.7}}>
+                Groups staff by classification and hours, ensures In-Charge coverage, rotates with 6–8 week gaps.
+              </div>
+
+              <label style={C.lbl}>First Monday of your roster year</label>
+              <input type="date" style={{...C.inp,borderColor:firstMondayValid?"#1a3050":"#ef5350"}}
+                value={firstMonday||""}
+                onChange={e=>setFirstMonday(e.target.value)}
+              />
+              {firstMonday&&!firstMondayValid&&(
+                <div style={{fontSize:10,color:"#ef5350",marginBottom:8,marginTop:-6}}>
+                  ⚠ This date is not a Monday — please select a Monday
+                </div>
+              )}
+              {firstMondayValid&&(
+                <div style={{fontSize:10,color:"#66bb6a",marginBottom:8,marginTop:-6}}>
+                  ✅ Fortnights will start from {fmtDate(firstMonday)}
+                </div>
+              )}
+
+              <label style={C.lbl}>Year</label>
               <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:14}}>
                 <button style={C.btnSec} onClick={()=>setYear(y=>y-1)}>‹</button>
                 <strong style={{color:"#a8dadc",fontSize:18,minWidth:48,textAlign:"center"}}>{year}</strong>
                 <button style={C.btnSec} onClick={()=>setYear(y=>y+1)}>›</button>
               </div>
-              <button style={C.btnPrimary} onClick={autoGen}>🔄 Auto-Generate {year}</button>
-              {nightPlanData&&<div style={{fontSize:10,color:"#66bb6a",marginTop:8}}>✅ Plan active — {nightPlanData.groups?.length} groups</div>}
+              <button style={{...C.btnPrimary,opacity:firstMondayValid?1:0.4}} onClick={autoGen}>
+                🔄 Auto-Generate {year}
+              </button>
+              {nightPlanData&&(
+                <div style={{fontSize:10,color:"#66bb6a",marginTop:8}}>
+                  ✅ Plan active — {nightPlanData.groups?.length} groups
+                  {nightPlanData.firstMonday&&` · from ${fmtDate(nightPlanData.firstMonday)}`}
+                </div>
+              )}
             </div>
           </div>
 
