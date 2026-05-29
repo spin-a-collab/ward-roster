@@ -503,6 +503,47 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     const hasNIC=d.N.some(id=>{const x=staff.find(y=>y.id===id);return x&&isInCharge(x);});
     if(!hasNIC&&d.N.length>0)warnings.push({iso,sh:"N",type:"incharge",msg:"No In-Charge (nights)"});
   });
+
+  // Isolated shift detection — any staff member working a single shift
+  // with days off (or leave) on both sides
+  staff.forEach(s=>{
+    days.forEach(({iso})=>{
+      // Is this person working today?
+      const d=roster[iso];
+      const workingToday=d.D.includes(s.id)||d.E.includes(s.id)||d.N.includes(s.id);
+      if(!workingToday)return;
+
+      // What shift are they on?
+      const todayShift=d.D.includes(s.id)?"D":d.E.includes(s.id)?"E":"N";
+
+      // Check day before and after
+      const prevIso=isoDate(addDays(new Date(iso),-1));
+      const nextIso=isoDate(addDays(new Date(iso), 1));
+
+      function isOff(checkIso){
+        const dr=roster[checkIso];
+        if(!dr)return true; // outside roster period = off
+        const onShift=dr.D.includes(s.id)||dr.E.includes(s.id)||dr.N.includes(s.id);
+        const onLeave=leaveMap[s.id]?.[checkIso];
+        return !onShift&&!onLeave || !!onLeave; // off OR on leave = not a worked shift
+      }
+
+      const prevOff=isOff(prevIso);
+      const nextOff=isOff(nextIso);
+
+      if(prevOff&&nextOff){
+        // Check if this shift was requested by the staff member
+        const wasRequested=Object.keys(s.requests||{}).some(k=>k.startsWith(iso+"_"));
+        warnings.push({
+          iso, sh:todayShift, type:"isolated",
+          msg:`${s.name}: isolated ${todayShift} shift${wasRequested?" (requested by staff)":""}`,
+          staffId: s.id,
+          requested: wasRequested,
+        });
+      }
+    });
+  });
+
   staff.forEach(s=>{
     const v=hoursSummary[s.id];
     if(Math.abs(v.variance)>8)warnings.push({iso:"—",sh:"Hrs",type:"hours",msg:`${s.name}: ${v.worked}h worked vs ${v.target}h target (${v.variance>0?"+":""}${v.variance}h)`});
@@ -951,7 +992,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
   );
 
   const days=roster.days||[];
-  const wBT={staffing:0,incharge:0,hours:0};
+  const wBT={staffing:0,incharge:0,hours:0,isolated:0};
   (roster.warnings||[]).forEach(w=>{ wBT[w.type]=(wBT[w.type]||0)+1; });
 
   return(
@@ -979,6 +1020,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
             {wBT.staffing>0&&<span style={{...C.warnBadge,background:"#4a2000"}}>👥 {wBT.staffing} staffing</span>}
             {wBT.incharge>0&&<span style={{...C.warnBadge,background:"#3a0030"}}>⭐ {wBT.incharge} in-charge</span>}
             {wBT.hours>0&&<span style={{...C.warnBadge,background:"#003030"}}>⏱ {wBT.hours} hours</span>}
+            {wBT.isolated>0&&<span style={{...C.warnBadge,background:"#3a2a00"}}>⚠ {wBT.isolated} isolated</span>}
           </div>
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -1066,15 +1108,37 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                         const def=SHIFT_DEF[code]||null;
                         const wknd=dayIdx(iso)>=5;
                         const autoADO=code==="ADO"&&roster.adoInserted?.[nurse.id]?.includes(iso);
+                        // Isolated shift detection — check warnings
+                        const isolated=["D","E","N"].includes(code)&&
+                          (roster.warnings||[]).some(w=>
+                            w.type==="isolated"&&w.iso===iso&&w.staffId===nurse.id
+                          );
+                        const isolatedRequested=isolated&&
+                          (roster.warnings||[]).some(w=>
+                            w.type==="isolated"&&w.iso===iso&&w.staffId===nurse.id&&w.requested
+                          );
                         return(
                           <td key={iso}
-                            style={{...C.td,background:def?def.bg:wknd?"#0d0814":"transparent",textAlign:"center",padding:1,
-                              cursor:CARD_CODES.includes(code)?"default":"pointer",
-                              borderLeft:wknd?"2px solid #2a1030":"1px solid #111a28"}}
-                            onClick={()=>!CARD_CODES.includes(code)&&cycleCell(nurse.id,iso)}
-                            title={code?(def?.label+(autoADO?" ★ auto-inserted":"")):("Off — click to add")}>
+                            style={{
+                              ...C.td,
+                              background:def?def.bg:wknd?"#0d0814":"transparent",
+                              textAlign:"center",padding:1,
+                              cursor:CARD_CODES.includes(code)||isLocked?"default":"pointer",
+                              borderLeft:wknd?"2px solid #2a1030":"1px solid #111a28",
+                              // Isolated shift: amber outline
+                              outline:isolated?`2px solid ${isolatedRequested?"#64b5f6":"#ffa726"}`:"none",
+                              outlineOffset:"-2px",
+                              position:"relative",
+                            }}
+                            onClick={()=>!CARD_CODES.includes(code)&&!isLocked&&cycleCell(nurse.id,iso)}
+                            title={
+                              isolated
+                                ? `⚠ Isolated shift — ${nurse.name} works alone this day${isolatedRequested?" (requested)":""}\n${code}: ${def?.label||""}`
+                                : code?(def?.label+(autoADO?" ★ auto-inserted":"")):"Off — click to add"
+                            }>
                             <span style={{fontSize:9,fontWeight:700,color:def?def.text:"#1a3050",display:"block",lineHeight:"22px"}}>
                               {code||""}{autoADO&&<span style={{fontSize:6,verticalAlign:"super"}}>★</span>}
+                              {isolated&&<span style={{fontSize:6,verticalAlign:"super",color:isolatedRequested?"#64b5f6":"#ffa726"}}>!</span>}
                             </span>
                           </td>
                         );
@@ -1092,6 +1156,8 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
               </span>
             ))}
             <span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:"#0a1a0a",color:"#a5d6a7",border:"1px solid #43a04744"}}><b>ADO★</b> Auto-inserted</span>
+            <span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:"#1a1200",color:"#ffa726",border:"1px solid #ffa72644"}}><b>⚠!</b> Isolated shift</span>
+            <span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:"#0a1422",color:"#64b5f6",border:"1px solid #64b5f644"}}><b>!</b> Isolated (requested)</span>
           </div>
           <h3 style={{...C.sectionH,marginTop:20}}>Daily Staffing Counts</h3>
           <div style={{overflowX:"auto",border:"1px solid #1a3050",borderRadius:8,marginTop:6}}>
@@ -1168,10 +1234,15 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
         <div>
           <h3 style={C.sectionH}>Scheduling Warnings — {(roster.warnings||[]).length} total</h3>
           {(roster.warnings||[]).length===0&&<div style={{color:"#2a5070",padding:16}}>✅ No warnings — roster looks good.</div>}
-          {["staffing","incharge","hours"].map(type=>{
+          {["staffing","incharge","hours","isolated"].map(type=>{
             const items=(roster.warnings||[]).filter(w=>w.type===type);
             if(!items.length)return null;
-            const meta={staffing:{title:"Staffing Levels",icon:"👥",color:"#ffa726"},incharge:{title:"In-Charge Coverage",icon:"⭐",color:"#ce93d8"},hours:{title:"Hours Variance",icon:"⏱",color:"#80deea"}};
+            const meta={
+              staffing:{title:"Staffing Levels",    icon:"👥",color:"#ffa726"},
+              incharge:{title:"In-Charge Coverage", icon:"⭐",color:"#ce93d8"},
+              hours:   {title:"Hours Variance",     icon:"⏱",color:"#80deea"},
+              isolated:{title:"Isolated Shifts",    icon:"⚠",color:"#ffa726"},
+            };
             const m=meta[type];
             return(
               <div key={type} style={{...C.card,marginBottom:14}}>
