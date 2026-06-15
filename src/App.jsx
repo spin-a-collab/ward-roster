@@ -50,42 +50,56 @@ const FWA_CONDITIONS = {
 
 // Date/formatting utilities
 
+// Parse a date string as LOCAL time (not UTC) to avoid timezone day-shift bugs.
+// new Date("2026-05-25") parses as UTC midnight which in AEST = Sun 24 May locally.
+// This function always returns the correct local date.
+function parseLocalDate(dateStr) {
+  if (!dateStr) return null;
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d); // local midnight — no UTC shift
+}
+
 const addDays  = (d,n) => { const x=new Date(d); x.setDate(x.getDate()+n); return x; };
-const isoDate  = d => new Date(d).toISOString().split("T")[0];
-const fmtDate  = d => new Date(d).toLocaleDateString("en-AU",{day:"2-digit",month:"2-digit",year:"numeric"});
-const fmtShort = d => { const dt=new Date(d); return `${dt.getDate()} ${MONTH_NAMES[dt.getMonth()]}`; };
-const dayIdx   = d => { const w=new Date(d).getDay(); return w===0?6:w-1; };
+const isoDate  = d => {
+  // Format as YYYY-MM-DD in LOCAL time (not UTC)
+  const dt = new Date(d);
+  const y  = dt.getFullYear();
+  const m  = String(dt.getMonth()+1).padStart(2,"0");
+  const dd = String(dt.getDate()).padStart(2,"0");
+  return `${y}-${m}-${dd}`;
+};
+const fmtDate  = d => parseLocalDate(typeof d==="string"?d:isoDate(d))?.toLocaleDateString("en-AU",{day:"2-digit",month:"2-digit",year:"numeric"}) || "";
+const fmtShort = d => { const dt=parseLocalDate(typeof d==="string"?d:isoDate(d))||new Date(d); return `${dt.getDate()} ${MONTH_NAMES[dt.getMonth()]}`; };
+const dayIdx   = d => { const w=(parseLocalDate(typeof d==="string"?d:isoDate(d))||new Date(d)).getDay(); return w===0?6:w-1; };
 const isWknd   = d => dayIdx(d)>=5;
-// getMon: always returns the Monday of the week containing date d.
-// Uses local date arithmetic to avoid UTC/timezone shift bugs.
+// getMon: always returns the Monday of the week containing date d, in local time.
 const getMon = d => {
-  const x = new Date(d);
-  // Reset to midnight in local time first
-  x.setHours(0, 0, 0, 0);
-  // getDay(): 0=Sun,1=Mon,...,6=Sat
-  const dow = x.getDay();
-  // Days to subtract to reach Monday: Sun→-6, Mon→0, Tue→-1, ... Sat→-5
-  const diff = dow === 0 ? -6 : 1 - dow;
-  x.setDate(x.getDate() + diff);
+  const x = parseLocalDate(typeof d==="string"?d:isoDate(d)) || new Date(d);
+  x.setHours(0,0,0,0);
+  const dow  = x.getDay(); // 0=Sun,1=Mon,...,6=Sat
+  const diff = dow===0 ? -6 : 1-dow; // Mon→0, Sun→-6, Tue→-1, etc.
+  x.setDate(x.getDate()+diff);
   return x;
 };
 
-// buildDays: always produces exactly weeks*7 days starting from startMon.
+// buildDays: always produces exactly weeks*7 days starting from startMon (local Monday).
 function buildDays(startMon, weeks) {
   const total = weeks * 7; // 2 weeks = 14, 4 weeks = 28
   return Array.from({length: total}, (_, i) => {
     const date = addDays(startMon, i);
+    const di   = dayIdx(date); // 0=Mon … 6=Sun (local)
     return {
       date,
-      iso:  isoDate(date),
-      di:   dayIdx(date),
-      wknd: isWknd(date),
+      iso:  isoDate(date), // local YYYY-MM-DD
+      di,
+      wknd: di >= 5,       // Sat=5, Sun=6
       wk:   Math.floor(i / 7),
     };
   });
 }
 
-const isInCharge = s => !!(CLASSIFICATIONS[s.cls]?.inCharge || s.inCharge);
+const isInCharge  = s => !!(CLASSIFICATIONS[s.cls]?.inCharge || s.inCharge);
+const fullName    = s => s ? `${s.firstName||""} ${s.lastName||""}`.trim() || s.name || "" : "";
 
 function fwaAllows(s,iso,shift) {
   for (const c of (s.fwaConditions||[])) {
@@ -208,30 +222,30 @@ function autoAssignNightPlan(staff, year, firstMonday) {
 }
 
 const SAMPLE_STAFF = [
-  {id:"s1", name:"Alexandra Chen",  cls:"NUM",  hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s2", name:"James Hartley",   cls:"ANUM", hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s3", name:"Maria Santos",    cls:"ANUM", hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"Prefers day shifts",   resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s4", name:"David Okonkwo",   cls:"ANUM", hrs:64,permNights:false,inCharge:true, fwaConditions:[{type:"SPECIFIC_DAYS",days:[0,1,2,3,4],note:"Mon-Fri only (FWA)"}],prefs:"",resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s5", name:"Priya Patel",     cls:"CNS",  hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s6", name:"Tom Nguyen",      cls:"CNS",  hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s7", name:"Sarah Kim",       cls:"RN",   hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s8", name:"Luke Andersen",   cls:"RN",   hrs:64,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s9", name:"Fatima Al-Rawi",  cls:"RN",   hrs:48,permNights:false,inCharge:false,fwaConditions:[{type:"NO_NIGHTS",note:"FWA approved"},{type:"SPECIFIC_DAYS",days:[0,1,2,3,4],note:"Weekdays only"}],prefs:"",resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s10",name:"Grace Torres",    cls:"RN",   hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s11",name:"Ben Murphy",      cls:"RN",   hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"Happy to work weekends",resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s12",name:"Amara Diallo",    cls:"RN",   hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s13",name:"Chen Wei",        cls:"RN",   hrs:64,permNights:false,inCharge:false,fwaConditions:[{type:"MAX_HOURS_WEEK",value:32,note:"Max 32h/wk (FWA)"}],prefs:"",resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s14",name:"Nina Rodriguez",  cls:"RN",   hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s15",name:"Oscar Pietersen", cls:"RN",   hrs:48,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s16",name:"Yuki Tanaka",     cls:"GNP",  hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:"2025-01-15",leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s17",name:"Chloe Martin",    cls:"GNP",  hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:"2025-01-15",leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s18",name:"Raj Sharma",      cls:"GNP",  hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:"2025-03-01",leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s19",name:"Mei Lin",         cls:"EN",   hrs:64,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s20",name:"Patrick Flynn",   cls:"EN",   hrs:80,permNights:true, inCharge:false,fwaConditions:[],prefs:"Permanent nights",     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s21",name:"Zara Ahmed",      cls:"EN",   hrs:80,permNights:true, inCharge:false,fwaConditions:[],prefs:"Permanent nights",     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s22",name:"Sofia Russo",     cls:"RN",   hrs:80,permNights:true, inCharge:true, fwaConditions:[],prefs:"Permanent nights",     resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s23",name:"James Brennan",   cls:"RN",   hrs:80,permNights:false,inCharge:false,fwaConditions:[{type:"EVENINGS_ONLY",note:"Evening only (FWA)"}],prefs:"",resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
-  {id:"s24",name:"Lily Thompson",   cls:"RN",   hrs:64,permNights:false,inCharge:true, fwaConditions:[{type:"SPECIFIC_SHIFTS",shifts:["D","E"],note:"D/E only, no nights (FWA)"}],prefs:"",resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s1", firstName:"Alexandra",cls:"NUM",  hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2020-01-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s2", firstName:"James",    lastName:"Hartley",  cls:"ANUM",hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2019-03-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s3", firstName:"Maria",    lastName:"Santos",   cls:"ANUM",hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"Prefers day shifts",   resign:null,commencementDate:"2018-06-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s4", firstName:"David",    lastName:"Okonkwo",  cls:"ANUM",hrs:64,permNights:false,inCharge:true, fwaConditions:[{type:"SPECIFIC_DAYS",days:[0,1,2,3,4],note:"Mon-Fri only (FWA)"}],prefs:"",resign:null,commencementDate:"2021-02-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s5", firstName:"Priya",    lastName:"Patel",    cls:"CNS", hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2017-09-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s6", firstName:"Tom",      lastName:"Nguyen",   cls:"CNS", hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2016-11-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s7", firstName:"Sarah",    lastName:"Kim",      cls:"RN",  hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2020-07-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s8", firstName:"Luke",     lastName:"Andersen", cls:"RN",  hrs:64,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2022-01-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s9", firstName:"Fatima",   lastName:"Al-Rawi",  cls:"RN",  hrs:48,permNights:false,inCharge:false,fwaConditions:[{type:"NO_NIGHTS",note:"FWA approved"},{type:"SPECIFIC_DAYS",days:[0,1,2,3,4],note:"Weekdays only"}],prefs:"",resign:null,commencementDate:"2021-08-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s10",firstName:"Grace",    lastName:"Torres",   cls:"RN",  hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2019-05-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s11",firstName:"Ben",      lastName:"Murphy",   cls:"RN",  hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"Happy to work weekends",resign:null,commencementDate:"2020-03-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s12",firstName:"Amara",    lastName:"Diallo",   cls:"RN",  hrs:80,permNights:false,inCharge:true, fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2018-10-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s13",firstName:"Chen",     lastName:"Wei",      cls:"RN",  hrs:64,permNights:false,inCharge:false,fwaConditions:[{type:"MAX_HOURS_WEEK",value:32,note:"Max 32h/wk (FWA)"}],prefs:"",resign:null,commencementDate:"2023-01-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s14",firstName:"Nina",     lastName:"Rodriguez",cls:"RN",  hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2021-04-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s15",firstName:"Oscar",    lastName:"Pietersen",cls:"RN",  hrs:48,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2022-06-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s16",firstName:"Yuki",     lastName:"Tanaka",   cls:"GNP", hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2025-01-15",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s17",firstName:"Chloe",    lastName:"Martin",   cls:"GNP", hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2025-01-15",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s18",firstName:"Raj",      lastName:"Sharma",   cls:"GNP", hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2025-03-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s19",firstName:"Mei",      lastName:"Lin",      cls:"EN",  hrs:64,permNights:false,inCharge:false,fwaConditions:[],prefs:"",                     resign:null,commencementDate:"2022-09-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s20",firstName:"Patrick",  lastName:"Flynn",    cls:"EN",  hrs:80,permNights:true, inCharge:false,fwaConditions:[],prefs:"Permanent nights",     resign:null,commencementDate:"2018-01-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s21",firstName:"Zara",     lastName:"Ahmed",    cls:"EN",  hrs:80,permNights:true, inCharge:false,fwaConditions:[],prefs:"Permanent nights",     resign:null,commencementDate:"2019-07-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s22",firstName:"Sofia",    lastName:"Russo",    cls:"RN",  hrs:80,permNights:true, inCharge:true, fwaConditions:[],prefs:"Permanent nights",     resign:null,commencementDate:"2017-03-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s23",firstName:"James",    lastName:"Brennan",  cls:"RN",  hrs:80,permNights:false,inCharge:false,fwaConditions:[{type:"EVENINGS_ONLY",note:"Evening only (FWA)"}],prefs:"",resign:null,commencementDate:"2023-06-01",leaveCard:[],gridLeave:{},requests:{}},
+  {id:"s24",firstName:"Lily",     lastName:"Thompson", cls:"RN",  hrs:64,permNights:false,inCharge:true, fwaConditions:[{type:"SPECIFIC_SHIFTS",shifts:["D","E"],note:"D/E only, no nights (FWA)"}],prefs:"",resign:null,commencementDate:"2024-02-01",leaveCard:[],gridLeave:{},requests:{}},
 ];
 
 // ─── ROSTER GENERATOR v3 ─────────────────────────────────────
@@ -241,53 +255,54 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   const roster={};
   days.forEach(d=>{ roster[d.iso]={D:[],E:[],N:[]}; });
 
-  const leaveMap=buildLeaveMap(staff);
+  // Only roster active staff — commenced before roster end, not yet resigned/archived
+  const rosterEnd = isoDate(addDays(startMon, weeks*7-1));
+  const activeStaff = staff.filter(s=>{
+    if(s.archived)return false;
+    if(s.commencementDate && s.commencementDate > rosterEnd)return false;
+    if(s.resign && s.resign < isoDate(startMon))return false;
+    return true;
+  });
+  // Use activeStaff throughout generator instead of staff
+  const leaveMap=buildLeaveMap(activeStaff);
 
   // Period targets — contracted hours is already per fortnight (2 weeks)
-  // For a 4-week roster, double it. weeks=2 → multiplier=1. weeks=4 → multiplier=2.
   const multiplier = weeks / 2;
   const periodTarget = {};
   const maxShifts = {};
-  staff.forEach(s => {
+  activeStaff.forEach(s => {
     const raw = s.hrs * multiplier;
     periodTarget[s.id] = s.permNights ? Math.floor(raw / 10) * 10 : raw;
   });
 
   // Hours worked — pre-load leave hours FIRST so maxShifts accounts for them
   const hw = {};
-  staff.forEach(s => { hw[s.id] = 0; });
-  staff.forEach(s => {
+  activeStaff.forEach(s => { hw[s.id] = 0; });
+  activeStaff.forEach(s => {
     days.forEach(d => {
-      const lc = leaveMap[s.id][d.iso];
+      const lc = leaveMap[s.id]?.[d.iso];
       if (!lc || !SHIFT_DEF[lc]) return;
       hw[s.id] += (s.permNights || nightPlanData?.plan?.[s.id]?.[d.iso]) ? 10 : 8;
     });
   });
 
-  // maxShifts: how many actual rostered shifts this person can still work
-  // = (target - hours already consumed by leave) / shift length, floored
-  // This is a HARD ceiling — canWork() refuses once reached.
-  staff.forEach(s => {
+  // maxShifts: hard ceiling — canWork() refuses once reached.
+  activeStaff.forEach(s => {
     const remainingHrs = Math.max(0, periodTarget[s.id] - hw[s.id]);
-    if (s.permNights) {
-      maxShifts[s.id] = Math.floor(remainingHrs / 10);
-    } else {
-      // Use floor so we never exceed contracted hours
-      maxShifts[s.id] = Math.floor(remainingHrs / 8);
-    }
+    maxShifts[s.id] = s.permNights ? Math.floor(remainingHrs/10) : Math.floor(remainingHrs/8);
   });
 
-  // Shift count tracker — incremented every time a shift is assigned
+  // Shift count tracker
   const shiftCount = {};
-  staff.forEach(s => { shiftCount[s.id] = 0; });
+  activeStaff.forEach(s => { shiftCount[s.id] = 0; });
 
   // ADO tracking
   const adoAccrued={},adoTaken={},adoMap={};
-  staff.forEach(s=>{ adoAccrued[s.id]=0; adoTaken[s.id]=0; adoMap[s.id]={}; });
+  activeStaff.forEach(s=>{ adoAccrued[s.id]=0; adoTaken[s.id]=0; adoMap[s.id]={}; });
 
   // Weekend counts (seeded from history)
   const wkndCnt={};
-  staff.forEach(s=>{ wkndCnt[s.id]=(recentWkndCounts?.[s.id]||0); });
+  activeStaff.forEach(s=>{ wkndCnt[s.id]=(recentWkndCounts?.[s.id]||0); });
 
   const prevTail=previousRoster?.tail||{};
 
@@ -311,27 +326,32 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   }
 
   function canWork(s, iso, shift) {
-    if (!s || s.resigned) return false;
-    if (s.resign && new Date(iso) >= new Date(s.resign)) return false;
+    if (!s || s.archived) return false;
+    // Must have commenced before this date
+    if (s.commencementDate && parseLocalDate(iso) < parseLocalDate(s.commencementDate)) return false;
+    // Must not have resigned — resignation date is last day of work, so exclude days AFTER it
+    if (s.resign && parseLocalDate(iso) > parseLocalDate(s.resign)) return false;
     if (leaveMap[s.id][iso]) return false;
-    if (adoMap[s.id][iso]) return false;
+    if (adoMap[s.id][iso])   return false;
     if (assignedToday(s.id, iso)) return false;
     if (s.permNights && shift !== "N") return false;
     if (!s.permNights && shift === "N" && !nightPlanData?.plan?.[s.id]?.[iso]) return false;
     if (!fwaAllows(s, iso, shift)) return false;
-    // DUAL HARD CEILING — checked dynamically so ADO insertions are reflected:
-    // 1. No hours remaining for another shift
+    // DUAL HARD CEILING
     const shiftHrs = shift === "N" ? 10 : 8;
     if (hw[s.id] + shiftHrs > periodTarget[s.id]) return false;
-    // 2. Shift count ceiling (belt-and-braces, uses cached maxShifts as upper bound)
     if (shiftCount[s.id] >= maxShifts[s.id]) return false;
     const maxW = s.fwaConditions?.find(c => c.type === "MAX_HOURS_WEEK")?.value;
     if (maxW && weekHrs(s.id, iso, shiftHrs) > maxW) return false;
-    if (s.cls === "GNP" && s.gnpStart && shift === "N" && new Date(iso) < addDays(new Date(s.gnpStart), 91)) return false;
+    // No night shifts in first 3 months for ALL staff (not just GNP)
+    if (s.commencementDate && shift === "N") {
+      const cutoff = addDays(parseLocalDate(s.commencementDate), 91);
+      if (parseLocalDate(iso) < cutoff) return false;
+    }
     if (shift === "N" && consecNights(s.id, iso) >= 4) return false;
     if (shift !== "N" && consecShifts(s.id, iso) >= 5) return false;
     if ((shift === "D" || shift === "E") && nightWithin47h(s.id, iso)) return false;
-    if (shift === "E" && onShift(s.id, isoDate(addDays(new Date(iso), -1)), "N")) return false;
+    if (shift === "E" && onShift(s.id, isoDate(addDays(parseLocalDate(iso), -1)), "N")) return false;
     return true;
   }
 
@@ -360,40 +380,30 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     if(best){adoMap[s.id][best]=true;hw[s.id]+=thresh;}
   }
 
-  const totalGNP=staff.filter(s=>s.cls==="GNP").length;
+  const totalGNP=activeStaff.filter(s=>s.cls==="GNP").length;
   const maxGNPShift=Math.max(1,Math.floor(totalGNP/2));
   let numHasWorked=false;
 
-  // Track staff redirected from nights to D/E (for warnings)
-  const redirectedFromNights = []; // { staffId, name, reason }
+  const redirectedFromNights = [];
 
-  // Helper: recompute remaining shifts for a staff member at any point in time
   function remainingShifts(s) {
     const shiftHrs = s.permNights ? 10 : 8;
     const hrsLeft = Math.max(0, periodTarget[s.id] - hw[s.id]);
     return Math.floor(hrsLeft / shiftHrs);
   }
 
-  // ── PHASE 1: Night shifts ─────────────────────────────────
-  // Hard cap: 5 per night shift. If more staff are in the night plan
-  // than needed, excess staff are flagged and moved to D/E automatically.
-  // Track per-staff: did they exceed their night hours ceiling this period?
-  const nightHoursCeiling = {}; // staffId -> max night hours this period
-  staff.forEach(s => {
-    if (s.permNights) {
-      nightHoursCeiling[s.id] = periodTarget[s.id]; // perm: use full target
-    } else {
-      // Rotating: night-adjusted hours = floor(hrs/10)*10 per fortnight
-      nightHoursCeiling[s.id] = Math.floor((s.hrs * (weeks/2)) / 10) * 10;
-    }
+  const nightHoursCeiling = {};
+  activeStaff.forEach(s => {
+    nightHoursCeiling[s.id] = s.permNights
+      ? periodTarget[s.id]
+      : Math.floor((s.hrs * (weeks/2)) / 10) * 10;
   });
 
-  // Track night hours assigned per staff this period
   const nightHrsAssigned = {};
-  staff.forEach(s => { nightHrsAssigned[s.id] = 0; });
+  activeStaff.forEach(s => { nightHrsAssigned[s.id] = 0; });
 
   days.forEach(({iso}) => {
-    const eligible = staff.filter(s => canWork(s,iso,"N")).sort((a,b) => {
+    const eligible = activeStaff.filter(s => canWork(s,iso,"N")).sort((a,b) => {
       if (a.permNights && !b.permNights) return -1;
       if (!a.permNights && b.permNights) return  1;
       return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
@@ -411,8 +421,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
           if (!alreadyRedirected) {
             redirectedFromNights.push({
               staffId: s.id,
-              name:    s.name,
-              reason:  `Night shift full (5/5) on ${iso} — moved to Day/Evening shifts`,
+              name:    fullName(s),
             });
           }
         }
@@ -425,7 +434,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
         if (!redirectedFromNights.some(r=>r.staffId===s.id)) {
           redirectedFromNights.push({
             staffId: s.id,
-            name:    s.name,
+            name:    fullName(s),
             reason:  `Night hours ceiling reached (${nightHoursCeiling[s.id]}h) — moved to Day/Evening shifts`,
           });
         }
@@ -436,7 +445,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       if (s.cls==="GNP" && gnpCnt >= 1) continue;
       if (s.cls==="ANUM") {
         if (anumCnt >= 1) {
-          const other = roster[iso].N.map(id=>staff.find(x=>x.id===id)).find(x=>x?.cls==="ANUM");
+          const other = roster[iso].N.map(id=>activeStaff.find(x=>x.id===id)).find(x=>x?.cls==="ANUM");
           if (!other || other.hrs < 80 || s.hrs < 80) continue;
         }
         anumCnt++;
@@ -462,21 +471,19 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   // ── ADO accrual at each week boundary ─────────────────────
   days.filter(d=>d.di===6).forEach(sun => {
     const monIso = isoDate(addDays(sun.date,-6));
-    staff.filter(s=>s.hrs>=80).forEach(s => {
+    activeStaff.filter(s=>s.hrs>=80).forEach(s => {
       let worked = false;
       for (let i=0;i<7;i++) {
-        const k=isoDate(addDays(new Date(monIso),i));
+        const k=isoDate(addDays(parseLocalDate(monIso),i));
         if (roster[k]?.D.includes(s.id)||roster[k]?.E.includes(s.id)||
-            roster[k]?.N.includes(s.id)||leaveMap[s.id][k]) { worked=true; break; }
+            roster[k]?.N.includes(s.id)||leaveMap[s.id]?.[k]) { worked=true; break; }
       }
       if (!worked) return;
       adoAccrued[s.id] += 2;
       const nightCtx = s.permNights ||
-        Array.from({length:7},(_,i)=>isoDate(addDays(new Date(monIso),i)))
+        Array.from({length:7},(_,i)=>isoDate(addDays(parseLocalDate(monIso),i)))
           .some(k=>nightPlanData?.plan?.[s.id]?.[k]);
       tryInsertADO(s, sun.iso, nightCtx);
-      // IMPORTANT: After ADO insertion, hw[s.id] may have increased.
-      // maxShifts is dynamic via remainingShifts(), so canWork() stays accurate.
     });
   });
 
@@ -501,9 +508,8 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     const isNUMSlot = shift==="D" && di>=1 && di<=3 && !numHasWorked;
 
     const redirectedIds = new Set(redirectedFromNights.map(r=>r.staffId));
-    const eligible = staff.filter(s => {
+    const eligible = activeStaff.filter(s => {
       if (s.permNights) return false;
-      // Night plan staff can't work D/E — UNLESS they were redirected due to night cap
       if (nightPlanData?.plan?.[s.id]?.[iso] && !redirectedIds.has(s.id)) return false;
       return canWork(s, iso, shift);
     }).sort((a,b) => {
@@ -534,7 +540,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       if (s.cls==="NUM") { if (!isNUMSlot||numHasWorked) continue; numOn=true; }
       if (s.cls==="ANUM") {
         if (anumCnt >= 1) continue;
-        if (numOn||roster[iso][shift].some(id=>staff.find(x=>x.id===id)?.cls==="NUM")) continue;
+        if (numOn||roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="NUM")) continue;
         anumCnt++;
       }
       if (s.cls==="EN" && enCnt >= 1) continue;
@@ -572,7 +578,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   });
 
   // Merge ADO into leaveMap for display
-  staff.forEach(s=>{ Object.keys(adoMap[s.id]).forEach(iso=>{ leaveMap[s.id][iso]="ADO"; }); });
+  activeStaff.forEach(s=>{ Object.keys(adoMap[s.id]).forEach(iso=>{ leaveMap[s.id][iso]="ADO"; }); });
 
   // Tail for next roster (last 7 days)
   const tail={};
@@ -580,7 +586,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
 
   // Hours summary
   const hoursSummary={};
-  staff.forEach(s=>{
+  activeStaff.forEach(s=>{
     hoursSummary[s.id]={
       target:periodTarget[s.id],
       worked:hw[s.id],
@@ -598,49 +604,36 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     ["D","E"].forEach(sh=>{
       const exp=wknd?9:10;
       if(d[sh].length<exp)warnings.push({iso,sh,type:"staffing",msg:`Understaffed: ${d[sh].length}/${exp}`});
-      const hasIC=d[sh].some(id=>{const x=staff.find(y=>y.id===id);return x&&isInCharge(x);});
+      const hasIC=d[sh].some(id=>{const x=activeStaff.find(y=>y.id===id);return x&&isInCharge(x);});
       if(!hasIC&&d[sh].length>0)warnings.push({iso,sh,type:"incharge",msg:"No In-Charge nurse"});
     });
     if(d.N.length<5)warnings.push({iso,sh:"N",type:"staffing",msg:`Night understaffed: ${d.N.length}/5`});
-    const hasNIC=d.N.some(id=>{const x=staff.find(y=>y.id===id);return x&&isInCharge(x);});
+    const hasNIC=d.N.some(id=>{const x=activeStaff.find(y=>y.id===id);return x&&isInCharge(x);});
     if(!hasNIC&&d.N.length>0)warnings.push({iso,sh:"N",type:"incharge",msg:"No In-Charge (nights)"});
   });
 
-  // Isolated shift detection — any staff member working a single shift
-  // with days off (or leave) on both sides
-  staff.forEach(s=>{
+  // Isolated shift detection
+  activeStaff.forEach(s=>{
     days.forEach(({iso})=>{
-      // Is this person working today?
       const d=roster[iso];
       const workingToday=d.D.includes(s.id)||d.E.includes(s.id)||d.N.includes(s.id);
       if(!workingToday)return;
-
-      // What shift are they on?
       const todayShift=d.D.includes(s.id)?"D":d.E.includes(s.id)?"E":"N";
-
-      // Check day before and after
-      const prevIso=isoDate(addDays(new Date(iso),-1));
-      const nextIso=isoDate(addDays(new Date(iso), 1));
-
+      const prevIso=isoDate(addDays(parseLocalDate(iso),-1));
+      const nextIso=isoDate(addDays(parseLocalDate(iso), 1));
       function isOff(checkIso){
         const dr=roster[checkIso];
-        if(!dr)return true; // outside roster period = off
+        if(!dr)return true;
         const onShift=dr.D.includes(s.id)||dr.E.includes(s.id)||dr.N.includes(s.id);
         const onLeave=leaveMap[s.id]?.[checkIso];
-        return !onShift&&!onLeave || !!onLeave; // off OR on leave = not a worked shift
+        return !onShift||!!onLeave;
       }
-
-      const prevOff=isOff(prevIso);
-      const nextOff=isOff(nextIso);
-
-      if(prevOff&&nextOff){
-        // Check if this shift was requested by the staff member
+      if(isOff(prevIso)&&isOff(nextIso)){
         const wasRequested=Object.keys(s.requests||{}).some(k=>k.startsWith(iso+"_"));
         warnings.push({
-          iso, sh:todayShift, type:"isolated",
-          msg:`${s.name}: isolated ${todayShift} shift${wasRequested?" (requested by staff)":""}`,
-          staffId: s.id,
-          requested: wasRequested,
+          iso,sh:todayShift,type:"isolated",
+          msg:`${fullName(s)}: isolated ${todayShift} shift${wasRequested?" (requested by staff)":""}`,
+          staffId:s.id, requested:wasRequested,
         });
       }
     });
@@ -652,9 +645,9 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   });
 
   // Hours variance warnings
-  staff.forEach(s=>{
+  activeStaff.forEach(s=>{
     const v=hoursSummary[s.id];
-    if(Math.abs(v.variance)>8)warnings.push({iso:"—",sh:"Hrs",type:"hours",msg:`${s.name}: ${v.worked}h worked vs ${v.target}h target (${v.variance>0?"+":""}${v.variance}h)`});
+    if(Math.abs(v.variance)>8)warnings.push({iso:"—",sh:"Hrs",type:"hours",msg:`${fullName(s)}: ${v.worked}h worked vs ${v.target}h target (${v.variance>0?"+":""}${v.variance}h)`});
   });
 
   const adoTotal=Object.values(adoMap).reduce((a,m)=>a+Object.keys(m).length,0);
@@ -662,7 +655,7 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     roster,leaveMap,hoursWorked:hw,hoursSummary,warnings,
     days:days.map(d=>d.iso),startDate:isoDate(startMon),
     tail,wkndCountEnd:{...wkndCnt},
-    adoInserted:Object.fromEntries(staff.map(s=>[s.id,Object.keys(adoMap[s.id])])),
+    adoInserted:Object.fromEntries(activeStaff.map(s=>[s.id,Object.keys(adoMap[s.id])])),
     adoTotal,
   };
 }
@@ -675,10 +668,10 @@ function validateRosterConfig({ staff, startDate, weeks, nightPlanData }) {
   const errors   = []; // blocking — must fix before generating
   const warnings = []; // non-blocking — should review
 
-  const startMon = getMon(new Date(startDate));
+  const startMon = getMon(parseLocalDate(startDate));
 
   // ── Start date checks ──
-  const dow = new Date(startDate).getDay();
+  const dow = parseLocalDate(startDate).getDay();
   if (dow !== 1) {
     errors.push({
       code: "START_NOT_MONDAY",
@@ -689,7 +682,7 @@ function validateRosterConfig({ staff, startDate, weeks, nightPlanData }) {
 
   // ── Staff checks ──
   const activeStaff = staff.filter(s => {
-    if (!s || s.resigned) return false;
+    if (!s || s.archived) return false;
     if (s.resign) {
       const rosterEnd = addDays(startMon, weeks * 7 - 1);
       if (new Date(s.resign) <= new Date(startDate)) return false;
@@ -802,28 +795,28 @@ function validateRosterConfig({ staff, startDate, weeks, nightPlanData }) {
     if (s.hrs < 16) {
       warnings.push({
         code: "VERY_LOW_HOURS",
-        msg:  `${s.name} is contracted to only ${s.hrs}h/fortnight — fewer than 2 shifts. They may be difficult to roster.`,
+        msg:  `${fullName(s)} is contracted to only ${s.hrs}h/fortnight — fewer than 2 shifts. They may be difficult to roster.`,
         fix:  "Verify contracted hours are correct.",
       });
     }
 
-    // GNP with no start date
-    if (s.cls === "GNP" && !s.gnpStart) {
+    // Staff with no commencement date — night restriction can't enforce
+    if (s.cls === "GNP" && !s.commencementDate) {
       warnings.push({
         code: "GNP_NO_START",
-        msg:  `${s.name} is a GNP with no start date set. Night shift restrictions (first 3 months) cannot be enforced.`,
-        fix:  "Set GNP Start Date in the Staff tab.",
+        msg:  `${fullName(s)} is a GNP with no Commencement Date set. Night shift restrictions (first 3 months) cannot be enforced.`,
+        fix:  "Set Commencement Date in the Staff tab.",
       });
     }
 
     // Resignation during roster period
     if (s.resign) {
-      const resignDate = new Date(s.resign);
+      const resignDate = parseLocalDate(s.resign);
       const rosterEnd  = addDays(startMon, weeks*7-1);
-      if (resignDate > new Date(startDate) && resignDate <= rosterEnd) {
+      if (resignDate > parseLocalDate(startDate) && resignDate <= rosterEnd) {
         warnings.push({
           code: "RESIGNING_MID_ROSTER",
-          msg:  `${s.name} resigns on ${fmtDate(s.resign)}, which falls within this roster period.`,
+          msg:  `${fullName(s)} resigns on ${fmtDate(s.resign)}, which falls within this roster period.`,
           fix:  "Check roster around their last day and adjust manually after generating.",
         });
       }
@@ -968,10 +961,10 @@ export default function App() {
     const r=activeKey&&rosters[activeKey]; if(!r)return toast("No roster","err");
     const wb=XLSX.utils.book_new();
     const days=r.days||[];
-    const hdrs=["Staff","Cls","Contract","Target","Worked","Variance","ADOs",...days.map(d=>{const dt=new Date(d);return `${DAY_NAMES[dayIdx(d)]} ${dt.getDate()}/${dt.getMonth()+1}`;})];
-    const rows=staff.filter(s=>!s.resigned).map(s=>{
+    const hdrs=["Staff","Cls","Contract","Target","Worked","Variance","ADOs",...days.map(d=>{const dt=parseLocalDate(d);return `${DAY_NAMES[dayIdx(d)]} ${dt.getDate()}/${dt.getMonth()+1}`;})];
+    const rows=staff.filter(s=>!s.archived).map(s=>{
       const hs=r.hoursSummary?.[s.id]||{target:s.hrs,worked:0,variance:0,adoCount:0};
-      const row=[s.name,s.cls,s.hrs,hs.target,hs.worked,hs.variance,hs.adoCount];
+      const row=[fullName(s),s.cls,s.hrs,hs.target,hs.worked,hs.variance,hs.adoCount];
       days.forEach(dk=>{
         const lc=r.leaveMap?.[s.id]?.[dk];
         if(lc)row.push(lc);
@@ -986,7 +979,7 @@ export default function App() {
     ws["!cols"]=hdrs.map((_,i)=>({wch:i<7?14:5}));
     XLSX.utils.book_append_sheet(wb,ws,"Roster");
     if((r.warnings||[]).length>0)XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([["Date","Shift","Type","Warning"],...r.warnings.map(w=>[w.iso,w.sh,w.type,w.msg])]),"Warnings");
-    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([["Staff","Cls","Contract","Target","Worked","Variance","ADOs"],...staff.filter(s=>!s.resigned).map(s=>{const hs=r.hoursSummary?.[s.id]||{};return[s.name,s.cls,s.hrs,hs.target||0,hs.worked||0,hs.variance||0,hs.adoCount||0];})]),"Hours Summary");
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([["Staff","Cls","Contract","Target","Worked","Variance","ADOs"],...staff.filter(s=>!s.archived).map(s=>{const hs=r.hoursSummary?.[s.id]||{};return[fullName(s),s.cls,s.hrs,hs.target||0,hs.worked||0,hs.variance||0,hs.adoCount||0];})]),"Hours Summary");
     XLSX.writeFile(wb,`WardRoster_${activeKey}.xlsx`);
     toast("Exported to Excel");
   }
@@ -999,7 +992,18 @@ export default function App() {
 
   const rosterKeys=Object.keys(rosters).sort().reverse();
 
-  // ── Delete roster ──
+  // Auto-archive staff whose resignation date has passed
+  useEffect(()=>{
+    const today = isoDate(new Date());
+    const needsArchive = staff.some(s=>s.resign&&!s.archived&&s.resign<today);
+    if(!needsArchive)return;
+    setStaff(prev=>prev.map(s=>{
+      if(s.resign&&!s.archived&&s.resign<today){
+        return {...s,archived:true};
+      }
+      return s;
+    }));
+  },[staff]);
   async function handleDeleteRoster(key) {
     const r = rosters[key]; if (!r) return;
     if (r.locked) {
@@ -1062,7 +1066,16 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
   const [filter,setFilter]=useState("");
   const [subTab,setSubTab]=useState("grid");
   const [showAll,setShowAll]=useState(false);
-  const visible=staff.filter(s=>!s.resigned&&s.name.toLowerCase().includes(filter.toLowerCase()));
+  const CLS_ORDER = {NUM:0,ANUM:1,CNS:2,RN:3,GNP:4,EN:5};
+  const visible = staff
+    .filter(s=>!s.archived && (s.firstName||s.name||"").toLowerCase().includes(filter.toLowerCase()))
+    .sort((a,b)=>{
+      const co=(CLS_ORDER[a.cls]??9)-(CLS_ORDER[b.cls]??9);
+      if(co!==0)return co;
+      const an=`${a.lastName||""} ${a.firstName||a.name||""}`.trim();
+      const bn=`${b.lastName||""} ${b.firstName||b.name||""}`.trim();
+      return an.localeCompare(bn);
+    });
   const isLocked = roster?.locked || false;
 
   function getCell(sId,iso){
@@ -1312,14 +1325,14 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                 </tr>
               </thead>
               <tbody>
-                {staff.filter(s=>!s.resigned).map((s,i)=>{
+                {staff.filter(s=>!s.archived).map((s,i)=>{
                   const hs=roster.hoursSummary?.[s.id]||{target:s.hrs,worked:0,variance:0,adoCount:0,shifts:0,maxShifts:0};
                   const cls=CLASSIFICATIONS[s.cls];
                   const ok=Math.abs(hs.variance)<=8,warn=Math.abs(hs.variance)<=16;
                   const col=ok?"#66bb6a":warn?"#ffa726":"#ef5350";
                   return(
                     <tr key={s.id} style={{background:i%2===0?"#0a1828":"#07101e",borderTop:"1px solid #0d1e30"}}>
-                      <td style={{...C.td,padding:"8px 12px",fontWeight:600,color:"#c8d8e8"}}>{s.name}</td>
+                      <td style={{...C.td,padding:"8px 12px",fontWeight:600,color:"#c8d8e8"}}>{fullName(s)}</td>
                       <td style={{...C.td,padding:"8px 12px"}}><span style={{fontSize:10,color:cls?.color,background:cls?.color+"22",borderRadius:6,padding:"1px 7px",fontWeight:700}}>{s.cls}</span></td>
                       <td style={{...C.td,padding:"8px 12px",color:"#7fb3d3"}}>{s.hrs}h/fn</td>
                       <td style={{...C.td,padding:"8px 12px",color:"#a8dadc",fontWeight:700}}>{hs.target}h</td>
@@ -1580,13 +1593,25 @@ function StaffTab({staff,setStaff,toast}){
   const [form,setForm]=useState(null);
   const [filterCls,setFilterCls]=useState("ALL");
   const importRef=useRef();
-  const blank={id:`s${Date.now()}`,name:"",cls:"RN",hrs:80,permNights:false,inCharge:false,fwaConditions:[],prefs:"",resign:null,gnpStart:null,leaveCard:[],gridLeave:{},requests:{}};
+  const blank={
+    id:`s${Date.now()}`,firstName:"",lastName:"",cls:"RN",hrs:"",
+    permNights:false,inCharge:false,fwaConditions:[],prefs:"",
+    resign:null,commencementDate:null,
+    leaveCard:[],gridLeave:{},requests:{},archived:false,
+  };
 
   function startEdit(s){setForm({...s,fwaConditions:[...(s.fwaConditions||[])]});setEditing(s.id);}
   function startNew(){setForm({...blank,id:`s${Date.now()}`});setEditing("new");}
+
   function saveForm(){
-    if(!form.name.trim())return toast("Name required","err");
-    if(editing==="new")setStaff(p=>[...p,form]); else setStaff(p=>p.map(s=>s.id===form.id?form:s));
+    const errors=[];
+    if(!form.firstName?.trim())errors.push("First Name is required");
+    if(!form.lastName?.trim())errors.push("Last Name is required");
+    if(!form.hrs||isNaN(Number(form.hrs))||Number(form.hrs)<=0)errors.push("Contracted Hours is required");
+    if(!form.commencementDate)errors.push("Commencement Date is required");
+    if(errors.length>0){toast(errors[0],"err");return;}
+    const saved={...form,hrs:Number(form.hrs)};
+    if(editing==="new")setStaff(p=>[...p,saved]); else setStaff(p=>p.map(s=>s.id===form.id?saved:s));
     setEditing(null);toast("Saved");
   }
   function remove(id){if(!confirm("Remove this staff member?"))return;setStaff(p=>p.filter(s=>s.id!==id));toast("Removed");}
@@ -1600,7 +1625,7 @@ function StaffTab({staff,setStaff,toast}){
         const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
         const imported=rows.map((r,i)=>({...blank,id:r.ID||`imp${i}`,name:r.Name||"",cls:r.Classification||"RN",hrs:Number(r.ContractedHours)||80,
           permNights:r.PermanentNights==="Yes",inCharge:r.InChargeSkill==="Yes",prefs:r.Preferences||"",
-          resign:r.ResignationDate||null,gnpStart:r.GNP_StartDate||null,
+          resign:r.ResignationDate||null,commencementDate:r.CommencementDate||r.GNP_StartDate||null,
           fwaConditions:r.FWA==="Yes"?[{type:"CUSTOM",note:r.FWA_Notes||"See agreement"}]:[],
         }));
         setStaff(p=>{const ids=new Set(p.map(s=>s.id));return[...p,...imported.filter(s=>!ids.has(s.id))];});
@@ -1631,17 +1656,37 @@ function StaffTab({staff,setStaff,toast}){
           <h2 style={C.pageH}>{editing==="new"?"Add Staff Member":"Edit: "+f.name}</h2>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
-          {[["Full Name","name","text"],["Contracted Hours / Fortnight","hrs","number"],["GNP Start Date","gnpStart","date"],["Resignation Date","resign","date"]].map(([l,k,t])=>(
-            <div key={k}><label style={C.lbl}>{l}</label>
-              <input type={t} style={C.inp} value={f[k]||""} onChange={e=>sf(p=>({...p,[k]:t==="number"?Number(e.target.value)||0:(e.target.value||null)}))}/>
-            </div>
-          ))}
-          <div><label style={C.lbl}>Classification</label>
+          <div>
+            <label style={C.lbl}>First Name <span style={{color:"#ef5350"}}>*</span></label>
+            <input type="text" style={{...C.inp,borderColor:!f.firstName?.trim()&&editing?"#ef535066":undefined}}
+              value={f.firstName||""} onChange={e=>sf(p=>({...p,firstName:e.target.value}))}/>
+          </div>
+          <div>
+            <label style={C.lbl}>Last Name <span style={{color:"#ef5350"}}>*</span></label>
+            <input type="text" style={C.inp} value={f.lastName||""} onChange={e=>sf(p=>({...p,lastName:e.target.value}))}/>
+          </div>
+          <div>
+            <label style={C.lbl}>Contracted Hours / Fortnight <span style={{color:"#ef5350"}}>*</span></label>
+            <input type="number" style={C.inp} placeholder="e.g. 80" value={f.hrs||""} onChange={e=>sf(p=>({...p,hrs:e.target.value}))}/>
+          </div>
+          <div>
+            <label style={C.lbl}>Commencement Date <span style={{color:"#ef5350"}}>*</span></label>
+            <input type="date" style={C.inp} value={f.commencementDate||""} onChange={e=>sf(p=>({...p,commencementDate:e.target.value||null}))}/>
+            <div style={{fontSize:9,color:"#4a7fa0",marginTop:-8}}>No night shifts for first 3 months from this date</div>
+          </div>
+          <div>
+            <label style={C.lbl}>Resignation Date</label>
+            <input type="date" style={C.inp} value={f.resign||""} onChange={e=>sf(p=>({...p,resign:e.target.value||null}))}/>
+            <div style={{fontSize:9,color:"#4a7fa0",marginTop:-8}}>Staff auto-archived after this date</div>
+          </div>
+          <div>
+            <label style={C.lbl}>Classification</label>
             <select style={C.inp} value={f.cls} onChange={e=>sf(p=>({...p,cls:e.target.value}))}>
               {Object.entries(CLASSIFICATIONS).map(([k,v])=><option key={k} value={k}>{k} — {v.label}</option>)}
             </select>
           </div>
-          <div><label style={C.lbl}>Known Preferences</label>
+          <div style={{gridColumn:"1/-1"}}>
+            <label style={C.lbl}>Known Preferences</label>
             <input type="text" style={C.inp} value={f.prefs||""} onChange={e=>sf(p=>({...p,prefs:e.target.value}))}/>
           </div>
         </div>
@@ -1716,7 +1761,18 @@ function StaffTab({staff,setStaff,toast}){
     );
   }
 
-  const filtered=staff.filter(s=>filterCls==="ALL"||s.cls===filterCls);
+  const CLS_ORDER={NUM:0,ANUM:1,CNS:2,RN:3,GNP:4,EN:5};
+  const filtered=staff
+    .filter(s=>(filterCls==="ALL"||s.cls===filterCls)&&
+      fullName(s).toLowerCase().includes(""))
+    .sort((a,b)=>{
+      // Active before archived
+      if(a.archived&&!b.archived)return 1;
+      if(!a.archived&&b.archived)return -1;
+      const co=(CLS_ORDER[a.cls]??9)-(CLS_ORDER[b.cls]??9);
+      if(co!==0)return co;
+      return fullName(a).localeCompare(fullName(b));
+    });
   return(
     <div>
       <div style={C.toolbar}>
@@ -1735,19 +1791,20 @@ function StaffTab({staff,setStaff,toast}){
         {filtered.map(nurse=>{
           const cls=CLASSIFICATIONS[nurse.cls];
           return(
-            <div key={nurse.id} style={{...C.card,opacity:nurse.resigned?0.5:1}}>
+            <div key={nurse.id} style={{...C.card,opacity:nurse.archived?0.5:1}}>
               <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:8}}>
                 <div style={{width:38,height:38,borderRadius:"50%",background:cls?.color+"33",color:cls?.color,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:14,flexShrink:0}}>
-                  {nurse.name.split(" ").map(w=>w[0]).join("").slice(0,2)}
+                  {`${(nurse.firstName||"")[0]||""}${(nurse.lastName||"")[0]||""}`.toUpperCase()||"?"}
                 </div>
                 <div style={{flex:1}}>
-                  <div style={{fontSize:13,fontWeight:700,color:"#c8d8e8"}}>{nurse.name}</div>
+                  <div style={{fontSize:13,fontWeight:700,color:"#c8d8e8"}}>{fullName(nurse)}</div>
                   <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:3}}>
                     <span style={{fontSize:9,color:cls?.color,background:cls?.color+"22",borderRadius:8,padding:"1px 6px",fontWeight:700}}>{nurse.cls}</span>
                     <span style={{fontSize:9,color:"#64b5f6",background:"#1a3050",borderRadius:8,padding:"1px 6px"}}>{nurse.hrs}h/fn</span>
                     {nurse.permNights&&<span style={C.bdg("#1a237e","#7986cb")}>Perm Nights</span>}
                     {nurse.inCharge&&<span style={C.bdg("#1a3000","#aed581")}>In-Charge</span>}
                     {nurse.fwaConditions?.length>0&&<span style={C.bdg("#1b4000","#81c784")}>FWA ×{nurse.fwaConditions.length}</span>}
+                    {nurse.archived&&<span style={C.bdg("#2a0000","#ef9a9a")}>Archived</span>}
                   </div>
                 </div>
                 <div style={{display:"flex",gap:4}}>
@@ -1760,6 +1817,7 @@ function StaffTab({staff,setStaff,toast}){
                   {nurse.fwaConditions.map((c,i)=><div key={i} style={{fontSize:10,color:"#81c784"}}>📋 {FWA_CONDITIONS[c.type]}{c.note?`: ${c.note}`:""}</div>)}
                 </div>
               )}
+              {nurse.commencementDate&&<div style={{fontSize:10,color:"#4a7fa0"}}>🗓 Started: {fmtDate(nurse.commencementDate)}</div>}
               {nurse.prefs&&<div style={{fontSize:10,color:"#4a7fa0",fontStyle:"italic"}}>💭 {nurse.prefs}</div>}
               {nurse.resign&&<div style={{fontSize:10,color:"#ef5350",marginTop:3}}>🚪 Resigning {fmtDate(nurse.resign)}</div>}
             </div>
@@ -1791,7 +1849,7 @@ function LeaveTab({staff,setStaff,toast}){
 
   const weekDays=Array.from({length:7},(_,i)=>{const date=addDays(weekStart,i);return{date,iso:isoDate(date),di:dayIdx(date),wknd:isWknd(date)};});
   const weekLabel=()=>`${fmtShort(weekDays[0].date)} – ${fmtShort(weekDays[6].date)} ${weekDays[6].date.getFullYear()}`;
-  const visible=staff.filter(s=>!s.resigned&&s.name.toLowerCase().includes(filterName.toLowerCase())&&(filterCls==="ALL"||s.cls===filterCls));
+  const visible=staff.filter(s=>!s.archived&&fullName(s).toLowerCase().includes(filterName.toLowerCase())&&(filterCls==="ALL"||s.cls===filterCls));
 
   function getLongLeave(sId,iso){return(staff.find(x=>x.id===sId)?.leaveCard||[]).find(l=>iso>=l.from&&iso<=l.to)||null;}
   function getLeaveCode(sId,iso){return staff.find(x=>x.id===sId)?.gridLeave?.[iso]||null;}
@@ -1994,7 +2052,7 @@ function LeaveTab({staff,setStaff,toast}){
                 <label style={C.lbl}>Staff Member</label>
                 <select style={C.inp} value={cardForm.staffId} onChange={e=>setCardForm(f=>({...f,staffId:e.target.value}))}>
                   <option value="">— Select —</option>
-                  {staff.filter(s=>!s.resigned).sort((a,b)=>a.name.localeCompare(b.name)).map(s=><option key={s.id} value={s.id}>{s.name} ({s.cls})</option>)}
+                  {staff.filter(s=>!s.archived).sort((a,b)=>fullName(a).localeCompare(fullName(b))).map(s=><option key={s.id} value={s.id}>{fullName(s)} ({s.cls})</option>)}
                 </select>
               </div>
               <div><label style={C.lbl}>Leave Type</label>
@@ -2017,7 +2075,7 @@ function LeaveTab({staff,setStaff,toast}){
               <div key={s.id} style={{...C.card,marginBottom:10}}>
                 <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
                   <span style={{width:9,height:9,borderRadius:"50%",background:cls?.color}}/>
-                  <span style={{fontWeight:700,color:"#c8d8e8",fontSize:13}}>{s.name}</span>
+                  <span style={{fontWeight:700,color:"#c8d8e8",fontSize:13}}>{fullName(s)}</span>
                   <span style={{fontSize:9,color:cls?.color,background:cls?.color+"22",borderRadius:6,padding:"1px 6px",fontWeight:700}}>{s.cls}</span>
                 </div>
                 {(s.leaveCard||[]).sort((a,b)=>a.from>b.from?1:-1).map(le=>{
@@ -2112,7 +2170,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
               {permStaff.map(s=>{const cls=CLASSIFICATIONS[s.cls];return(
                 <div key={s.id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
                   <span style={{width:7,height:7,borderRadius:"50%",background:cls?.color}}/>
-                  <span style={{fontSize:11,color:"#c8d8e8"}}>{s.name}</span>
+                  <span style={{fontSize:11,color:"#c8d8e8"}}>{fullName(s)}</span>
                   <span style={{fontSize:9,color:cls?.color}}>{s.cls}</span>
                   <span style={{fontSize:9,color:"#64b5f6",marginLeft:"auto"}}>{s.hrs}h</span>
                 </div>
@@ -2177,7 +2235,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                       {members.map(s=>{const cls=CLASSIFICATIONS[s.cls];return(
                         <div key={s.id} style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
                           <span style={{fontSize:9,color:cls?.color,background:cls?.color+"22",borderRadius:5,padding:"0 4px",fontWeight:700}}>{s.cls}</span>
-                          <span style={{fontSize:10,color:"#a8dadc"}}>{s.name}</span>
+                          <span style={{fontSize:10,color:"#a8dadc"}}>{fullName(s)}</span>
                           <span style={{fontSize:9,color:"#4a7fa0",marginLeft:"auto"}}>{s.hrs}h</span>
                         </div>
                       );})}
@@ -2327,7 +2385,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                             <div style={{display:"flex",alignItems:"center",gap:6}}>
                               {staffGroupColor&&<div style={{width:7,height:7,borderRadius:"50%",background:staffGroupColor,flexShrink:0}}/>}
                               {s.permNights&&<div style={{width:7,height:7,borderRadius:"50%",background:"#3949ab",flexShrink:0}}/>}
-                              <span style={{fontSize:11,color:"#c8d8e8",whiteSpace:"nowrap"}}>{s.name}</span>
+                              <span style={{fontSize:11,color:"#c8d8e8",whiteSpace:"nowrap"}}>{fullName(s)}</span>
                               <span style={{fontSize:9,color:cls?.color,marginLeft:"auto"}}>{s.cls}</span>
                             </div>
                           </td>
@@ -2347,7 +2405,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                                   :wknd?"#0d0814":"transparent",
                                 borderLeft:dt.getDate()===1?"2px solid #1a3050":"none",
                                 borderBottom:"1px solid #0a1525",
-                              }} title={isNightBlock?`${s.name}: Night${s.permNights?" (Perm)":` - Group ${gid}`} — ${iso}`:""}/>
+                              }} title={isNightBlock?`${fullName(s)}: Night${s.permNights?" (Perm)":` - Group ${gid}`} — ${iso}`:""}/>
                             );
                           }))}
                         </tr>
@@ -2389,7 +2447,7 @@ function ADOTab({ staff, rosters, adoAdjustments, setAdoAdjustments, toast }) {
   const [showHistory, setShowHistory] = useState(null); // staffId whose history is open
 
   // Only FT staff (80h+) accrue ADOs
-  const eligibleStaff = staff.filter(s => s.hrs >= 80 && !s.resigned);
+  const eligibleStaff = staff.filter(s => s.hrs >= 80 && !s.archived);
   const filtered = eligibleStaff.filter(s => filterCls === "ALL" || s.cls === filterCls);
 
   // Sort rosters chronologically
@@ -2470,7 +2528,7 @@ function ADOTab({ staff, rosters, adoAdjustments, setAdoAdjustments, toast }) {
     const rows = [["Staff","Classification","Contract","ADOs (auto)","ADOs (manual adj.)","Balance","Notes"]];
     eligibleStaff.forEach(s => {
       const ado = computeADO(s.id);
-      rows.push([s.name, s.cls, `${s.hrs}h/fn`, ado.autoTotal, ado.manualTotal, ado.balance,
+      rows.push([fullName(s), s.cls, `${s.hrs}h/fn`, ado.autoTotal, ado.manualTotal, ado.balance,
         ado.adjustments.map(a=>`${a.date}: ${a.value>0?"+":""}${a.value} (${a.note})`).join("; ")
       ]);
     });
@@ -2534,7 +2592,7 @@ function ADOTab({ staff, rosters, adoAdjustments, setAdoAdjustments, toast }) {
                       <td style={{...C.td,padding:"10px 14px",fontWeight:600,color:"#c8d8e8"}}>
                         <div style={{display:"flex",alignItems:"center",gap:7}}>
                           <span style={{width:8,height:8,borderRadius:"50%",background:cls?.color,flexShrink:0}}/>
-                          {s.name}
+                          {fullName(s)}
                           {s.permNights && <span style={C.bdg("#1a237e","#7986cb")}>Nights</span>}
                         </div>
                       </td>
@@ -2719,7 +2777,7 @@ function HistoryTab({ rosters, staff, activeKey, setActiveKey, setTab, onDelete 
       ["ADOs inserted",    sA.adoTotal,      sB.adoTotal],
       ["Status",           sA.locked?"🔒 Locked":"✏️ Draft", sB.locked?"🔒 Locked":"✏️ Draft"],
     ];
-    const staffToShow = staff.filter(s=>!s.resigned).slice(0,30);
+    const staffToShow = staff.filter(s=>!s.archived).slice(0,30);
     return (
       <div>
         <h3 style={{...C.sectionH,marginBottom:16}}>Roster Comparison</h3>
@@ -2769,7 +2827,7 @@ function HistoryTab({ rosters, staff, activeKey, setActiveKey, setTab, onDelete 
                     <td style={{...C.td,padding:"7px 14px"}}>
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
                         <span style={{width:7,height:7,borderRadius:"50%",background:cls?.color,flexShrink:0}}/>
-                        <span style={{fontSize:11,color:"#c8d8e8"}}>{s.name}</span>
+                        <span style={{fontSize:11,color:"#c8d8e8"}}>{fullName(s)}</span>
                       </div>
                     </td>
                     <td style={{...C.td,padding:"7px 14px",textAlign:"center",color:"#4a7fa0",fontSize:11}}>{s.hrs}h</td>
@@ -2782,7 +2840,7 @@ function HistoryTab({ rosters, staff, activeKey, setActiveKey, setTab, onDelete 
                   </tr>
                 );
               })}
-              {staff.filter(s=>!s.resigned).length>30&&(
+              {staff.filter(s=>!s.archived).length>30&&(
                 <tr><td colSpan={5} style={{...C.td,padding:"8px 14px",color:"#2a5070",fontSize:11,textAlign:"center"}}>Showing first 30 staff</td></tr>
               )}
             </tbody>
