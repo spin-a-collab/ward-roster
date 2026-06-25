@@ -249,7 +249,7 @@ const SAMPLE_STAFF = [
 ];
 
 // ─── ROSTER GENERATOR v3 ─────────────────────────────────────
-function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,recentWkndCounts}) {
+function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,recentWkndCounts,bumpHistory={}}) {
   const startMon=getMon(new Date(startDate));
   const days=buildDays(startMon,weeks);
   const roster={};
@@ -351,15 +351,35 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     if (shift === "N" && consecNights(s.id, iso) >= 4) return false;
     if (shift !== "N" && consecShifts(s.id, iso) >= 5) return false;
     if ((shift === "D" || shift === "E") && nightWithin47h(s.id, iso)) return false;
+    // E→N block: can't do Night if worked Evening yesterday (< 47h gap)
     if (shift === "E" && onShift(s.id, isoDate(addDays(parseLocalDate(iso), -1)), "N")) return false;
+    // E→D short changeover: allowed once per week, unless requested
+    if (shift === "D") {
+      const prevIso = isoDate(addDays(parseLocalDate(iso), -1));
+      if (onShift(s.id, prevIso, "E")) {
+        const alreadyHadEtoD = countEtoDThisWeek(s.id, isoDate(addDays(parseLocalDate(iso), -1))) >= 1;
+        const requested = !!(s.requests?.[`${iso}_D`]);
+        if (alreadyHadEtoD && !requested) return false;
+      }
+    }
     return true;
   }
 
-  function rotScore(sId,iso,shift){
-    if(shift==="D"&&onShift(sId,isoDate(addDays(new Date(iso),-1)),"E"))return 2;
-    if(shift==="E"&&onShift(sId,isoDate(addDays(new Date(iso),-1)),"D"))return 0;
-    if(shift==="N"&&onShift(sId,isoDate(addDays(new Date(iso),-1)),"E"))return 0;
-    return 1;
+  // Count E→D short changeovers in the same calendar week as iso
+  // E→D = worked Evening yesterday, working Day today (9.5h gap)
+  // Allowed once per week per staff member (unless requested)
+  function countEtoDThisWeek(sId, iso) {
+    const mon = getMon(parseLocalDate(iso));
+    let count = 0;
+    for (let i = 1; i < 7; i++) {
+      const dayIso  = isoDate(addDays(mon, i));
+      const prevIso = isoDate(addDays(mon, i - 1));
+      if (dayIso > iso) break;
+      const workedDtoday = roster[dayIso]?.D.includes(sId) || prevTail[dayIso]?.D?.includes(sId);
+      const workedEprev  = roster[prevIso]?.E.includes(sId) || prevTail[prevIso]?.E?.includes(sId);
+      if (workedDtoday && workedEprev) count++;
+    }
+    return count;
   }
 
   function tryInsertADO(s,upToIso,nightCtx){
@@ -384,87 +404,209 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   const maxGNPShift=Math.max(1,Math.floor(totalGNP/2));
   let numHasWorked=false;
 
-  const redirectedFromNights = [];
+  // ── UPFRONT SURPLUS RESOLUTION ────────────────────────────
+  // Determine who is in the night plan for this fortnight
+  const inNightPlanThisFn = new Set(
+    activeStaff
+      .filter(s => !s.permNights && days.some(d => nightPlanData?.plan?.[s.id]?.[d.iso]))
+      .map(s => s.id)
+  );
 
-  function remainingShifts(s) {
-    const shiftHrs = s.permNights ? 10 : 8;
-    const hrsLeft = Math.max(0, periodTarget[s.id] - hw[s.id]);
-    return Math.floor(hrsLeft / shiftHrs);
+  // Calculate actual night-hours need for this fortnight
+  // 5 staff × 10h × 14 nights = 700h, minus perm nights contribution,
+  // minus leave taken by night-plan staff during this period
+  const permNightStaff = activeStaff.filter(s => s.permNights);
+  const permNightHrs   = permNightStaff.reduce((a,s) => a + nightAdjustedHrs(s), 0);
+
+  // Leave hours already charged to night-plan rotating staff
+  const rotatingNightLeaveHrs = activeStaff
+    .filter(s => inNightPlanThisFn.has(s.id))
+    .reduce((total, s) => {
+      const leaveCount = days.filter(d => leaveMap[s.id]?.[d.iso]).length;
+      return total + leaveCount * 10;
+    }, 0);
+
+  // Effective rotating-hours available from night-plan staff
+  const rotatingNightStaff = activeStaff.filter(s => inNightPlanThisFn.has(s.id));
+  const rotatingNightHrsAvailable = rotatingNightStaff.reduce((a,s) => {
+    const adjHrs = nightAdjustedHrs(s);
+    const leaveHrs = days.filter(d => leaveMap[s.id]?.[d.iso]).length * 10;
+    return a + Math.max(0, adjHrs - leaveHrs);
+  }, 0);
+
+  const nightHrsNeeded = Math.max(0, 700 - permNightHrs); // rotating need
+
+  // Surplus = how many rotating hours over what's needed
+  const surplusHrs = rotatingNightHrsAvailable - nightHrsNeeded;
+
+  // Identify surplus staff to bump — using bump history for fairness
+  // bumpHistory: { staffId -> bumpCount } passed in from previous rosters
+  const bumpCounts = bumpHistory;
+
+  // Never bump: ANUM, GNP, permanent nights
+  // Bumpable: RN, CNS, EN (with EN last-resort protection)
+  const bumpable = rotatingNightStaff.filter(s =>
+    !s.permNights &&
+    s.cls !== "ANUM" &&
+    s.cls !== "GNP"
+  );
+
+  // EN protection: count ENs in night plan for this fortnight
+  const enInNightPlan = bumpable.filter(s => s.cls === "EN");
+  const nonEnBumpable = bumpable.filter(s => s.cls !== "EN");
+
+  // Sort bumpable by: fewest historical bumps first, then alpha
+  const sortBumpable = (arr) => [...arr].sort((a,b) => {
+    const ba = bumpCounts[a.id] || 0;
+    const bb = bumpCounts[b.id] || 0;
+    if (ba !== bb) return ba - bb;
+    return fullName(a).localeCompare(fullName(b));
+  });
+
+  const bumpedFromNights = new Set(); // staff IDs bumped for entire fortnight
+  const bumpedDetails   = [];         // { staffId, name, reason, bumpCount }
+
+  if (surplusHrs > 0) {
+    // Work through bumpable candidates until surplus is resolved
+    // Try non-EN first, then EN if still surplus remains
+    const candidates = [...sortBumpable(nonEnBumpable), ...sortBumpable(enInNightPlan)];
+
+    let remainingSurplus = surplusHrs;
+    for (const s of candidates) {
+      if (remainingSurplus <= 0) break;
+
+      // EN protection: don't bump if this is the last EN in night plan
+      if (s.cls === "EN") {
+        const enRemaining = enInNightPlan.filter(e => !bumpedFromNights.has(e.id));
+        if (enRemaining.length <= 1) break; // protect last EN
+      }
+
+      // Coverage check: don't bump if it would leave nights with no in-charge
+      // (we check this after, it's a soft guide — we'll enforce via warnings)
+
+      bumpedFromNights.add(s.id);
+      const adjHrs = nightAdjustedHrs(s);
+      const leaveHrs = days.filter(d => leaveMap[s.id]?.[d.iso]).length * 10;
+      remainingSurplus -= Math.max(0, adjHrs - leaveHrs);
+
+      bumpedDetails.push({
+        staffId:   s.id,
+        name:      fullName(s),
+        reason:    `Surplus night coverage — rostered to Day/Evening for this entire fortnight`,
+        bumpCount: (bumpCounts[s.id] || 0) + 1,
+      });
+    }
   }
 
+  // Track night hours ceiling and assigned
   const nightHoursCeiling = {};
   activeStaff.forEach(s => {
     nightHoursCeiling[s.id] = s.permNights
       ? periodTarget[s.id]
       : Math.floor((s.hrs * (weeks/2)) / 10) * 10;
   });
-
   const nightHrsAssigned = {};
   activeStaff.forEach(s => { nightHrsAssigned[s.id] = 0; });
 
-  days.forEach(({iso}) => {
-    const eligible = activeStaff.filter(s => canWork(s,iso,"N")).sort((a,b) => {
-      if (a.permNights && !b.permNights) return -1;
-      if (!a.permNights && b.permNights) return  1;
-      return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
-    });
+  // Helper: is this person eligible for nights on this day?
+  function eligibleForNights(s, iso) {
+    if (bumpedFromNights.has(s.id)) return false; // bumped for whole fortnight
+    if (!canWork(s, iso, "N")) return false;
+    return true;
+  }
 
-    let enCnt=0, gnpCnt=0, anumCnt=0, icOk=false;
-    const redirectThisNight = [];
+  // Helper: in-charge coverage check for a night shift roster
+  function nightInChargeCoverage(shiftStaffIds) {
+    const onShiftStaff = shiftStaffIds.map(id => activeStaff.find(x=>x.id===id)).filter(Boolean);
+    const anums   = onShiftStaff.filter(s => s.cls === "ANUM");
+    const icCapable = onShiftStaff.filter(s => isInCharge(s) && s.cls !== "ANUM");
+    if (anums.length >= 1) {
+      // ANUM present: need at least 1 additional in-charge capable non-ANUM
+      return icCapable.length >= 1;
+    } else {
+      // No ANUM: need at least 2 in-charge capable non-ANUM
+      return icCapable.length >= 2;
+    }
+  }
+
+  // ── PHASE 1: Night shifts ─────────────────────────────────
+  const nightInChargeMissing = new Set(); // iso dates where in-charge coverage not met
+
+  days.forEach(({iso, wk}) => {
+    const eligible = activeStaff
+      .filter(s => eligibleForNights(s, iso))
+      .sort((a,b) => {
+        if (a.permNights && !b.permNights) return -1;
+        if (!a.permNights && b.permNights) return  1;
+        return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
+      });
+
+    let enCnt=0, gnpCnt=0, anumCnt=0;
 
     for (const s of eligible) {
-      // Hard cap: max 5 on nights
-      if (roster[iso].N.length >= 5) {
-        // This person was in the night plan but can't fit — redirect to D/E
-        if (!s.permNights && nightPlanData?.plan?.[s.id]?.[iso]) {
-          const alreadyRedirected = redirectedFromNights.some(r=>r.staffId===s.id);
-          if (!alreadyRedirected) {
-            redirectedFromNights.push({
-              staffId: s.id,
-              name:    fullName(s),
-            });
-          }
-        }
-        continue;
-      }
+      if (roster[iso].N.length >= 5) break;
+      if (nightHrsAssigned[s.id] + 10 > nightHoursCeiling[s.id]) continue;
 
-      // Check night hours ceiling for this period
-      if (!s.permNights && nightHrsAssigned[s.id] + 10 > nightHoursCeiling[s.id]) {
-        // Would exceed their night hours allocation — redirect
-        if (!redirectedFromNights.some(r=>r.staffId===s.id)) {
-          redirectedFromNights.push({
-            staffId: s.id,
-            name:    fullName(s),
-            reason:  `Night hours ceiling reached (${nightHoursCeiling[s.id]}h) — moved to Day/Evening shifts`,
-          });
-        }
-        continue;
-      }
-
-      if (s.cls==="EN"  && enCnt  >= 1) continue;
-      if (s.cls==="GNP" && gnpCnt >= 1) continue;
-      if (s.cls==="ANUM") {
+      if (s.cls === "EN" && enCnt >= 1) continue;
+      if (s.cls === "GNP" && gnpCnt >= 1) continue;
+      if (s.cls === "ANUM") {
         if (anumCnt >= 1) {
+          // Two-ANUM exception: both must be 80h FT, AND every other night
+          // shift this week must already have exactly 1 ANUM
           const other = roster[iso].N.map(id=>activeStaff.find(x=>x.id===id)).find(x=>x?.cls==="ANUM");
           if (!other || other.hrs < 80 || s.hrs < 80) continue;
+          // Check all other nights this week have exactly 1 ANUM
+          const weekStart = addDays(parseLocalDate(iso), -dayIdx(iso)); // Mon of this week
+          const otherNightsThisWeek = Array.from({length:7},(_,i)=>isoDate(addDays(weekStart,i)))
+            .filter(k => k !== iso && roster[k]);
+          const allOthersHaveOneAnum = otherNightsThisWeek.every(k => {
+            const anumCount = roster[k].N.filter(id=>activeStaff.find(x=>x.id===id)?.cls==="ANUM").length;
+            return anumCount === 1;
+          });
+          if (!allOthersHaveOneAnum) continue;
         }
         anumCnt++;
       }
-      if (s.cls==="EN")  enCnt++;
-      if (s.cls==="GNP") gnpCnt++;
+      if (s.cls === "EN")  enCnt++;
+      if (s.cls === "GNP") gnpCnt++;
+
       roster[iso].N.push(s.id);
       hw[s.id] += 10;
       shiftCount[s.id]++;
       nightHrsAssigned[s.id] += 10;
-      if (isInCharge(s)) icOk = true;
     }
-    // In-charge fallback — must pass canWork
-    if (!icOk && roster[iso].N.length > 0) {
-      const ic = eligible.find(s =>
-        !roster[iso].N.includes(s.id) && isInCharge(s) && canWork(s,iso,"N") &&
-        nightHrsAssigned[s.id] + 10 <= nightHoursCeiling[s.id]
-      );
-      if (ic) { roster[iso].N.push(ic.id); hw[ic.id]+=10; shiftCount[ic.id]++; nightHrsAssigned[ic.id]+=10; }
+
+    // In-charge coverage enforcement
+    if (!nightInChargeCoverage(roster[iso].N) && roster[iso].N.length > 0) {
+      const anumOnShift = roster[iso].N.some(id=>activeStaff.find(x=>x.id===id)?.cls==="ANUM");
+      const icNeeded = anumOnShift ? 1 : 2;
+      const icHave = roster[iso].N.filter(id=>{
+        const x=activeStaff.find(y=>y.id===id);
+        return x && isInCharge(x) && x.cls!=="ANUM";
+      }).length;
+      const icShortfall = icNeeded - icHave;
+
+      // Try to add in-charge capable staff up to the shortfall
+      for (let i=0; i<icShortfall; i++) {
+        if (roster[iso].N.length >= 5) break;
+        const ic = eligible.find(s =>
+          !roster[iso].N.includes(s.id) &&
+          isInCharge(s) &&
+          s.cls !== "ANUM" &&
+          eligibleForNights(s, iso) &&
+          nightHrsAssigned[s.id] + 10 <= nightHoursCeiling[s.id]
+        );
+        if (ic) {
+          roster[iso].N.push(ic.id);
+          hw[ic.id] += 10;
+          shiftCount[ic.id]++;
+          nightHrsAssigned[ic.id] += 10;
+        } else {
+          nightInChargeMissing.add(iso);
+        }
+      }
+      // Final check
+      if (!nightInChargeCoverage(roster[iso].N)) nightInChargeMissing.add(iso);
     }
   });
 
@@ -503,15 +645,75 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   const midWeekDays = days.filter(d => !d.wknd && d.di!==0 && d.di!==4);
   const orderedDays = [...weekendDays, ...monFriDays, ...midWeekDays];
 
-  function fillShift(iso, di, wknd, shift) {
+  // ── Fill D and E TOGETHER per day, alternating, so neither shift
+  // starves the other of available staff hours. Within each day we
+  // fill one slot of D, then one slot of E, then back to D, etc.,
+  // up to each shift's base target — THEN allow overflow if hours remain.
+  function fillDayBalanced(iso, di, wknd) {
     const BASE = wknd ? 9 : 10;
-    const isNUMSlot = shift==="D" && di>=1 && di<=3 && !numHasWorked;
+    const CEILING = wknd ? BASE : BASE + 2;
 
-    const redirectedIds = new Set(redirectedFromNights.map(r=>r.staffId));
+    // Round 1: alternately fill D and E up to BASE each, balanced
+    let round = 0;
+    while (roster[iso].D.length < BASE || roster[iso].E.length < BASE) {
+      const shift = round % 2 === 0 ? "D" : "E";
+      const otherShift = shift === "D" ? "E" : "D";
+      round++;
+      if (roster[iso][shift].length >= BASE) {
+        // This shift is full for round 1 — try the other one once more
+        if (roster[iso][otherShift].length >= BASE) break; // both full
+        continue;
+      }
+      const before = roster[iso][shift].length;
+      fillOneSlot(iso, di, wknd, shift, BASE);
+      if (roster[iso][shift].length === before) {
+        // Couldn't fill — no eligible staff left for this shift.
+        // Mark as exhausted by forcing length check past BASE to exit loop for this shift only.
+        // We do this by checking total eligible remaining; if none, break entirely.
+        const stillEligible = ["D","E"].some(sh=>{
+          if (roster[iso][sh].length>=BASE) return false;
+          return activeStaff.some(s=>canWorkForFill(s,iso,sh));
+        });
+        if (!stillEligible) break;
+      }
+    }
+
+    // Round 2: overflow — fill remaining hours-deficit staff up to CEILING,
+    // alternating D/E so overflow is also balanced
+    round = 0;
+    while (roster[iso].D.length < CEILING || roster[iso].E.length < CEILING) {
+      const shift = round % 2 === 0 ? "D" : "E";
+      round++;
+      if (roster[iso][shift].length >= CEILING) {
+        if (roster[iso].D.length>=CEILING && roster[iso].E.length>=CEILING) break;
+        continue;
+      }
+      const before = roster[iso][shift].length;
+      fillOneSlot(iso, di, wknd, shift, CEILING, true);
+      if (roster[iso][shift].length === before) {
+        const stillEligible = ["D","E"].some(sh=>{
+          if (roster[iso][sh].length>=CEILING) return false;
+          return activeStaff.some(s=>canWorkForFill(s,iso,sh));
+        });
+        if (!stillEligible) break;
+      }
+    }
+  }
+
+  function canWorkForFill(s, iso, shift) {
+    if (s.permNights) return false;
+    // Staff in night plan for this fortnight work nights only —
+    // UNLESS they were bumped to D/E for the whole fortnight via surplus resolution
+    if (inNightPlanThisFn.has(s.id) && !bumpedFromNights.has(s.id)) return false;
+    return canWork(s, iso, shift);
+  }
+
+  function fillOneSlot(iso, di, wknd, shift, cap, overflowOnly=false) {
+    const isNUMSlot = shift==="D" && di>=1 && di<=3 && !numHasWorked;
     const eligible = activeStaff.filter(s => {
-      if (s.permNights) return false;
-      if (nightPlanData?.plan?.[s.id]?.[iso] && !redirectedIds.has(s.id)) return false;
-      return canWork(s, iso, shift);
+      if (!canWorkForFill(s, iso, shift)) return false;
+      if (overflowOnly && hw[s.id] >= periodTarget[s.id]) return false; // overflow only for hours-deficit
+      return true;
     }).sort((a,b) => {
       const aReq = !!(a.requests?.[`${iso}_${shift}`]);
       const bReq = !!(b.requests?.[`${iso}_${shift}`]);
@@ -521,60 +723,63 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
         const dw = (wkndCnt[a.id]||0) - (wkndCnt[b.id]||0);
         if (dw !== 0) return dw;
       }
-      const rA=rotScore(a.id,iso,shift), rB=rotScore(b.id,iso,shift);
-      if (rA !== rB) return rA - rB;
       // Most hours remaining first
       return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
     });
 
-    let anumCnt=0, enCnt=0, gnpCnt=0, numOn=false, icOk=false;
-
     for (const s of eligible) {
-      // Weekend: hard stop at BASE
-      if (wknd && roster[iso][shift].length >= BASE) break;
-      // Weekday: stop at BASE unless staff still have hours to fill
-      if (!wknd && roster[iso][shift].length >= BASE) {
-        if (hw[s.id] >= periodTarget[s.id]) continue;
+      if (roster[iso][shift].length >= cap) return;
+      if (s.cls==="NUM") {
+        if (!isNUMSlot||numHasWorked) continue;
       }
-
-      if (s.cls==="NUM") { if (!isNUMSlot||numHasWorked) continue; numOn=true; }
       if (s.cls==="ANUM") {
-        if (anumCnt >= 1) continue;
-        if (numOn||roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="NUM")) continue;
-        anumCnt++;
+        const anumAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="ANUM");
+        if (anumAlready) continue;
+        const numAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="NUM");
+        if (numAlready) continue;
       }
-      if (s.cls==="EN" && enCnt >= 1) continue;
-      if (s.cls==="GNP") { if (gnpCnt >= maxGNPShift) continue; gnpCnt++; }
-      if (s.cls==="EN") enCnt++;
+      if (s.cls==="EN") {
+        const enAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="EN");
+        if (enAlready) continue;
+      }
+      if (s.cls==="GNP") {
+        const gnpCount = roster[iso][shift].filter(id=>activeStaff.find(x=>x.id===id)?.cls==="GNP").length;
+        if (gnpCount >= maxGNPShift) continue;
+      }
 
       roster[iso][shift].push(s.id);
       hw[s.id] += 8;
       shiftCount[s.id]++;
       if (wknd) wkndCnt[s.id] = (wkndCnt[s.id]||0)+1;
-      if (isInCharge(s)) icOk = true;
       if (s.cls==="NUM") numHasWorked = true;
-    }
-
-    // In-charge fallback — MUST pass canWork (no ceiling bypass)
-    if (!icOk && roster[iso][shift].length > 0) {
-      const ic = eligible.find(s =>
-        !roster[iso][shift].includes(s.id) &&
-        isInCharge(s) &&
-        canWork(s, iso, shift)
-      );
-      if (ic) {
-        roster[iso][shift].push(ic.id);
-        hw[ic.id] += 8;
-        shiftCount[ic.id]++;
-        if (wknd) wkndCnt[ic.id] = (wkndCnt[ic.id]||0)+1;
-      }
+      return; // filled one slot, exit
     }
   }
 
-  // Run shifts in priority order
+  // Ensure in-charge coverage after balanced fill
+  function ensureInCharge(iso, shift, wknd) {
+    const hasIC = roster[iso][shift].some(id=>{
+      const x=activeStaff.find(y=>y.id===id); return x&&isInCharge(x);
+    });
+    if (hasIC || roster[iso][shift].length===0) return;
+    const ic = activeStaff.find(s =>
+      !roster[iso][shift].includes(s.id) &&
+      isInCharge(s) &&
+      canWorkForFill(s, iso, shift)
+    );
+    if (ic) {
+      roster[iso][shift].push(ic.id);
+      hw[ic.id] += 8;
+      shiftCount[ic.id]++;
+      if (wknd) wkndCnt[ic.id] = (wkndCnt[ic.id]||0)+1;
+    }
+  }
+
+  // Run shifts in priority order — weekends first, then Mon/Fri, then mid-week
   orderedDays.forEach(({iso, di, wknd}) => {
-    fillShift(iso, di, wknd, "D");
-    fillShift(iso, di, wknd, "E");
+    fillDayBalanced(iso, di, wknd);
+    ensureInCharge(iso, "D", wknd);
+    ensureInCharge(iso, "E", wknd);
   });
 
   // Merge ADO into leaveMap for display
@@ -608,8 +813,22 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       if(!hasIC&&d[sh].length>0)warnings.push({iso,sh,type:"incharge",msg:"No In-Charge nurse"});
     });
     if(d.N.length<5)warnings.push({iso,sh:"N",type:"staffing",msg:`Night understaffed: ${d.N.length}/5`});
-    const hasNIC=d.N.some(id=>{const x=activeStaff.find(y=>y.id===id);return x&&isInCharge(x);});
-    if(!hasNIC&&d.N.length>0)warnings.push({iso,sh:"N",type:"incharge",msg:"No In-Charge (nights)"});
+    // Night in-charge coverage check
+    if(d.N.length>0){
+      if(nightInChargeMissing.has(iso)){
+        warnings.push({iso,sh:"N",type:"nightincharge",msg:"Insufficient In-Charge coverage on nights — ANUM present needs 1 additional, no ANUM needs 2"});
+      }
+    }
+  });
+
+  // Night surplus — bumped staff
+  bumpedDetails.forEach(b=>{
+    warnings.push({
+      iso:"—",sh:"N→D/E",type:"nightSurplus",
+      msg:`${b.name} moved from Nights to Day/Evening for entire fortnight (surplus night coverage). Historical bumps: ${b.bumpCount}`,
+      staffId:b.staffId,
+      bumpCount:b.bumpCount,
+    });
   });
 
   // Isolated shift detection
@@ -639,11 +858,6 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     });
   });
 
-  // Redirected-from-nights warnings
-  redirectedFromNights.forEach(r=>{
-    warnings.push({iso:"—",sh:"N→DE",type:"redirected",msg:`${r.name}: ${r.reason}`});
-  });
-
   // Hours variance warnings
   activeStaff.forEach(s=>{
     const v=hoursSummary[s.id];
@@ -651,12 +865,22 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   });
 
   const adoTotal=Object.values(adoMap).reduce((a,m)=>a+Object.keys(m).length,0);
+
+  // Build updated bump history for this roster
+  const updatedBumpHistory = { ...(previousRoster?.bumpHistory || {}) };
+  bumpedDetails.forEach(b => {
+    updatedBumpHistory[b.staffId] = (updatedBumpHistory[b.staffId] || 0) + 1;
+  });
+
   return {
     roster,leaveMap,hoursWorked:hw,hoursSummary,warnings,
     days:days.map(d=>d.iso),startDate:isoDate(startMon),
     tail,wkndCountEnd:{...wkndCnt},
     adoInserted:Object.fromEntries(activeStaff.map(s=>[s.id,Object.keys(adoMap[s.id])])),
     adoTotal,
+    bumpHistory: updatedBumpHistory,
+    bumpedThisPeriod: bumpedDetails,
+    nightInChargeMissing: [...nightInChargeMissing],
   };
 }
 
@@ -947,7 +1171,11 @@ export default function App() {
         const r=rosters[k]; if(!r?.wkndCountEnd)return;
         Object.entries(r.wkndCountEnd).forEach(([id,cnt])=>{recentWknd[id]=(recentWknd[id]||0)+cnt;});
       });
-      const result=generateRoster({staff,startDate:genCfg.startDate,weeks:genCfg.weeks,nightPlanData,previousRoster:prevRoster,recentWkndCounts:recentWknd});
+      const result=generateRoster({
+        staff,startDate:genCfg.startDate,weeks:genCfg.weeks,
+        nightPlanData,previousRoster:prevRoster,recentWkndCounts:recentWknd,
+        bumpHistory: prevRoster?.bumpHistory || {},
+      });
       result.generatedAt=new Date().toISOString();
       setRosters(r=>({...r,[key]:result}));
       setActiveKey(key); setTab("roster");
@@ -1113,7 +1341,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
   );
 
   const days=roster.days||[];
-  const wBT={staffing:0,incharge:0,hours:0,isolated:0,redirected:0};
+  const wBT={staffing:0,incharge:0,hours:0,isolated:0,nightSurplus:0,nightincharge:0};
   (roster.warnings||[]).forEach(w=>{ wBT[w.type]=(wBT[w.type]||0)+1; });
 
   return(
@@ -1142,7 +1370,8 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
             {wBT.incharge>0&&<span style={{...C.warnBadge,background:"#3a0030"}}>⭐ {wBT.incharge} in-charge</span>}
             {wBT.hours>0&&<span style={{...C.warnBadge,background:"#003030"}}>⏱ {wBT.hours} hours</span>}
             {wBT.isolated>0&&<span style={{...C.warnBadge,background:"#3a2a00"}}>⚠ {wBT.isolated} isolated</span>}
-            {wBT.redirected>0&&<span style={{...C.warnBadge,background:"#002040"}}>🔀 {wBT.redirected} redirected</span>}
+            {wBT.nightSurplus>0&&<span style={{...C.warnBadge,background:"#002040"}}>🔀 {wBT.nightSurplus} night surplus</span>}
+            {wBT.nightincharge>0&&<span style={{...C.warnBadge,background:"#3a0020"}}>🌙 {wBT.nightincharge} night in-charge</span>}
           </div>
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -1230,7 +1459,6 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                         const def=SHIFT_DEF[code]||null;
                         const wknd=dayIdx(iso)>=5;
                         const autoADO=code==="ADO"&&roster.adoInserted?.[nurse.id]?.includes(iso);
-                        // Isolated shift detection — check warnings
                         const isolated=["D","E","N"].includes(code)&&
                           (roster.warnings||[]).some(w=>
                             w.type==="isolated"&&w.iso===iso&&w.staffId===nurse.id
@@ -1239,6 +1467,9 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                           (roster.warnings||[]).some(w=>
                             w.type==="isolated"&&w.iso===iso&&w.staffId===nurse.id&&w.requested
                           );
+                        // Night in-charge missing — highlight entire N column for that date
+                        const nightICMissing=code==="N"&&
+                          (roster.nightInChargeMissing||[]).includes(iso);
                         return(
                           <td key={iso}
                             style={{
@@ -1247,16 +1478,17 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                               textAlign:"center",padding:1,
                               cursor:CARD_CODES.includes(code)||isLocked?"default":"pointer",
                               borderLeft:wknd?"2px solid #2a1030":"1px solid #111a28",
-                              // Isolated shift: amber outline
-                              outline:isolated?`2px solid ${isolatedRequested?"#64b5f6":"#ffa726"}`:"none",
+                              outline:nightICMissing?"2px solid #ef5350":isolated?`2px solid ${isolatedRequested?"#64b5f6":"#ffa726"}`:"none",
                               outlineOffset:"-2px",
                               position:"relative",
                             }}
                             onClick={()=>!CARD_CODES.includes(code)&&!isLocked&&cycleCell(nurse.id,iso)}
                             title={
-                              isolated
-                                ? `⚠ Isolated shift — ${nurse.name} works alone this day${isolatedRequested?" (requested)":""}\n${code}: ${def?.label||""}`
-                                : code?(def?.label+(autoADO?" ★ auto-inserted":"")):"Off — click to add"
+                              nightICMissing
+                                ? `🌙 Insufficient In-Charge coverage on this night shift`
+                                : isolated
+                                  ? `⚠ Isolated shift — ${fullName(nurse)} works alone this day${isolatedRequested?" (requested)":""}\n${code}: ${def?.label||""}`
+                                  : code?(def?.label+(autoADO?" ★ auto-inserted":"")):"Off — click to add"
                             }>
                             <span style={{fontSize:9,fontWeight:700,color:def?def.text:"#1a3050",display:"block",lineHeight:"22px"}}>
                               {code||""}{autoADO&&<span style={{fontSize:6,verticalAlign:"super"}}>★</span>}
@@ -1280,6 +1512,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
             <span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:"#0a1a0a",color:"#a5d6a7",border:"1px solid #43a04744"}}><b>ADO★</b> Auto-inserted</span>
             <span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:"#1a1200",color:"#ffa726",border:"1px solid #ffa72644"}}><b>⚠!</b> Isolated shift</span>
             <span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:"#0a1422",color:"#64b5f6",border:"1px solid #64b5f644"}}><b>!</b> Isolated (requested)</span>
+            <span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:"#220a0a",color:"#ef5350",border:"1px solid #ef535044"}}><b>🌙</b> Night in-charge missing</span>
           </div>
           <h3 style={{...C.sectionH,marginTop:20}}>Daily Staffing Counts</h3>
           <div style={{overflowX:"auto",border:"1px solid #1a3050",borderRadius:8,marginTop:6}}>
@@ -1356,15 +1589,16 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
         <div>
           <h3 style={C.sectionH}>Scheduling Warnings — {(roster.warnings||[]).length} total</h3>
           {(roster.warnings||[]).length===0&&<div style={{color:"#2a5070",padding:16}}>✅ No warnings — roster looks good.</div>}
-          {["staffing","incharge","hours","isolated","redirected"].map(type=>{
+          {["staffing","incharge","nightincharge","nightSurplus","hours","isolated"].map(type=>{
             const items=(roster.warnings||[]).filter(w=>w.type===type);
             if(!items.length)return null;
             const meta={
-              staffing:  {title:"Staffing Levels",          icon:"👥",color:"#ffa726"},
-              incharge:  {title:"In-Charge Coverage",       icon:"⭐",color:"#ce93d8"},
-              hours:     {title:"Hours Variance",           icon:"⏱",color:"#80deea"},
-              isolated:  {title:"Isolated Shifts",          icon:"⚠",color:"#ffa726"},
-              redirected:{title:"Redirected from Nights",   icon:"🔀",color:"#64b5f6"},
+              staffing:     {title:"Staffing Levels",              icon:"👥",color:"#ffa726"},
+              incharge:     {title:"In-Charge Coverage (D/E)",     icon:"⭐",color:"#ce93d8"},
+              nightincharge:{title:"Night In-Charge Coverage",     icon:"🌙",color:"#ef9a9a"},
+              nightSurplus: {title:"Night Surplus — Moved to D/E", icon:"🔀",color:"#64b5f6"},
+              hours:        {title:"Hours Variance",               icon:"⏱",color:"#80deea"},
+              isolated:     {title:"Isolated Shifts",              icon:"⚠",color:"#ffa726"},
             };
             const m=meta[type];
             return(
@@ -1676,8 +1910,15 @@ function StaffTab({staff,setStaff,toast}){
           </div>
           <div>
             <label style={C.lbl}>Resignation Date</label>
-            <input type="date" style={C.inp} value={f.resign||""} onChange={e=>sf(p=>({...p,resign:e.target.value||null}))}/>
-            <div style={{fontSize:9,color:"#4a7fa0",marginTop:-8}}>Staff auto-archived after this date</div>
+            <div style={{display:"flex",gap:6}}>
+              <input type="date" style={{...C.inp,flex:1}} value={f.resign||""} onChange={e=>sf(p=>({...p,resign:e.target.value||null}))}/>
+              {f.resign&&(
+                <button type="button" style={{...C.btnSec,fontSize:10,padding:"0 10px"}} onClick={()=>sf(p=>({...p,resign:null}))}>✕ Clear</button>
+              )}
+            </div>
+            <div style={{fontSize:9,color:f.resign?"#ef9a9a":"#4a7fa0",marginTop:2}}>
+              {f.resign ? `Last working day: ${fmtDate(f.resign)} — staff auto-archived after this date` : "Leave blank unless this staff member has resigned"}
+            </div>
           </div>
           <div>
             <label style={C.lbl}>Classification</label>
@@ -2271,6 +2512,63 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
               </div>
             </>
           )}
+
+          {/* Bump History Ledger */}
+          {Object.keys(nightPlanData?.bumpHistory||rosters&&Object.values(rosters).reduce((acc,r)=>{
+            Object.entries(r.bumpHistory||{}).forEach(([k,v])=>{acc[k]=(acc[k]||0)+v;});
+            return acc;
+          },{})||{}).length>0&&(()=>{
+            const allBumps=Object.values(rosters).reduce((acc,r)=>{
+              Object.entries(r.bumpHistory||{}).forEach(([k,v])=>{acc[k]=(acc[k]||0)+v;});
+              return acc;
+            },{});
+            if(!Object.keys(allBumps).length)return null;
+            return(
+              <>
+                <h3 style={{...C.sectionH,marginTop:24}}>Night Surplus — Bump History</h3>
+                <div style={{fontSize:11,color:"#4a7fa0",marginBottom:10}}>
+                  Staff moved from nights to Day/Evening due to surplus night coverage.
+                  Staff with fewer bumps are prioritised for bumping next time to ensure fairness.
+                  🟢 = 1 bump &nbsp; 🟡 = 2 bumps &nbsp; 🔴 = 3+ bumps
+                </div>
+                <div style={{border:"1px solid #1a3050",borderRadius:8,overflow:"hidden",marginBottom:16}}>
+                  <table style={{borderCollapse:"collapse",width:"100%"}}>
+                    <thead>
+                      <tr style={{background:"#060e18"}}>
+                        {["Staff","Class","Total Bumps","Protection"].map(h=>(
+                          <th key={h} style={{...C.th,textAlign:"left",padding:"8px 12px",fontSize:11}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(allBumps)
+                        .sort(([,a],[,b])=>b-a)
+                        .map(([sId,count],i)=>{
+                          const s=staff.find(x=>x.id===sId); if(!s)return null;
+                          const cls=CLASSIFICATIONS[s.cls];
+                          const col=count>=3?"#ef5350":count>=2?"#ffa726":"#66bb6a";
+                          const neverBump=s.cls==="ANUM"||s.cls==="GNP"||s.permNights;
+                          return(
+                            <tr key={sId} style={{background:i%2===0?"#0a1828":"#07101e",borderTop:"1px solid #0d1e30"}}>
+                              <td style={{...C.td,padding:"8px 12px",fontWeight:600,color:"#c8d8e8"}}>{fullName(s)}</td>
+                              <td style={{...C.td,padding:"8px 12px"}}>
+                                <span style={{fontSize:10,color:cls?.color,background:cls?.color+"22",borderRadius:6,padding:"1px 7px",fontWeight:700}}>{s.cls}</span>
+                              </td>
+                              <td style={{...C.td,padding:"8px 12px"}}>
+                                <span style={{fontWeight:700,fontSize:13,color:col}}>{count}</span>
+                              </td>
+                              <td style={{...C.td,padding:"8px 12px",fontSize:10,color:neverBump?"#ef9a9a":"#4a7fa0"}}>
+                                {neverBump?"🛡 Never bumped (protected)":"Eligible for bumping"}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            );
+          })()}
         </div>
       )}
 
