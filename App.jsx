@@ -351,15 +351,35 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     if (shift === "N" && consecNights(s.id, iso) >= 4) return false;
     if (shift !== "N" && consecShifts(s.id, iso) >= 5) return false;
     if ((shift === "D" || shift === "E") && nightWithin47h(s.id, iso)) return false;
+    // E→N block: can't do Night if worked Evening yesterday (< 47h gap)
     if (shift === "E" && onShift(s.id, isoDate(addDays(parseLocalDate(iso), -1)), "N")) return false;
+    // E→D short changeover: allowed once per week, unless requested
+    if (shift === "D") {
+      const prevIso = isoDate(addDays(parseLocalDate(iso), -1));
+      if (onShift(s.id, prevIso, "E")) {
+        const alreadyHadEtoD = countEtoDThisWeek(s.id, isoDate(addDays(parseLocalDate(iso), -1))) >= 1;
+        const requested = !!(s.requests?.[`${iso}_D`]);
+        if (alreadyHadEtoD && !requested) return false;
+      }
+    }
     return true;
   }
 
-  function rotScore(sId,iso,shift){
-    if(shift==="D"&&onShift(sId,isoDate(addDays(new Date(iso),-1)),"E"))return 2;
-    if(shift==="E"&&onShift(sId,isoDate(addDays(new Date(iso),-1)),"D"))return 0;
-    if(shift==="N"&&onShift(sId,isoDate(addDays(new Date(iso),-1)),"E"))return 0;
-    return 1;
+  // Count E→D short changeovers in the same calendar week as iso
+  // E→D = worked Evening yesterday, working Day today (9.5h gap)
+  // Allowed once per week per staff member (unless requested)
+  function countEtoDThisWeek(sId, iso) {
+    const mon = getMon(parseLocalDate(iso));
+    let count = 0;
+    for (let i = 1; i < 7; i++) {
+      const dayIso  = isoDate(addDays(mon, i));
+      const prevIso = isoDate(addDays(mon, i - 1));
+      if (dayIso > iso) break;
+      const workedDtoday = roster[dayIso]?.D.includes(sId) || prevTail[dayIso]?.D?.includes(sId);
+      const workedEprev  = roster[prevIso]?.E.includes(sId) || prevTail[prevIso]?.E?.includes(sId);
+      if (workedDtoday && workedEprev) count++;
+    }
+    return count;
   }
 
   function tryInsertADO(s,upToIso,nightCtx){
@@ -609,159 +629,196 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     });
   });
 
-  // ── PHASE 2: Day & Evening ────────────────────────────────
-  // PRIORITY ORDER for filling shifts:
-  //   1. Weekend days (Sat/Sun) — fill these first across all staff
-  //   2. Monday and Friday — priority weekdays
-  //   3. Tuesday, Wednesday, Thursday — fill last (overstaffing allowed here)
+  // ── PHASE 2: Day & Evening — Three-Pass Approach ────────────
   //
-  // Within each priority tier, process D and E shifts.
-  // This ensures high-priority days are fully staffed before mid-week
-  // uses up staff shift allowances.
+  // PASS 1: Priority fill — weekends + Mon/Fri to BASE
+  // PASS 2: Pre-allocate mid-week using block preference scoring
+  // PASS 3: Refinement — fix isolated shifts by adding adjacent days
 
-  // Build day lists in priority order
-  const weekendDays = days.filter(d => d.wknd);
-  const monFriDays  = days.filter(d => !d.wknd && (d.di===0||d.di===4)); // Mon=0,Fri=4
-  const midWeekDays = days.filter(d => !d.wknd && d.di!==0 && d.di!==4);
-  const orderedDays = [...weekendDays, ...monFriDays, ...midWeekDays];
+  // ── Dynamic ceiling ──────────────────────────────────────
+  const deEligibleStaff = activeStaff.filter(s =>
+    !s.permNights && (!inNightPlanThisFn.has(s.id) || bumpedFromNights.has(s.id))
+  );
+  const totalDEshifts = deEligibleStaff.reduce((sum,s) => {
+    const leaveHrs = days.filter(d => leaveMap[s.id]?.[d.iso]).length * 8;
+    return sum + Math.max(0, Math.floor((periodTarget[s.id] - leaveHrs) / 8));
+  }, 0);
+  const weekdayCount = days.filter(d=>!d.wknd).length;
+  const weekendCount = days.filter(d=>d.wknd).length;
+  const totalSlots   = weekdayCount * 20 + weekendCount * 18; // 2 shifts × staffing target per day
+  const surplusDE    = Math.max(0, totalDEshifts - totalSlots);
+  const surplusPerSlot = weekdayCount > 0 ? surplusDE / (weekdayCount * 2) : 0;
+  const WEEKDAY_CEILING = Math.min(14, Math.round(10 + surplusPerSlot));
 
-  // ── Fill D and E TOGETHER per day, alternating, so neither shift
-  // starves the other of available staff hours. Within each day we
-  // fill one slot of D, then one slot of E, then back to D, etc.,
-  // up to each shift's base target — THEN allow overflow if hours remain.
-  function fillDayBalanced(iso, di, wknd) {
-    const BASE = wknd ? 9 : 10;
-    const CEILING = wknd ? BASE : BASE + 2;
-
-    // Round 1: alternately fill D and E up to BASE each, balanced
-    let round = 0;
-    while (roster[iso].D.length < BASE || roster[iso].E.length < BASE) {
-      const shift = round % 2 === 0 ? "D" : "E";
-      const otherShift = shift === "D" ? "E" : "D";
-      round++;
-      if (roster[iso][shift].length >= BASE) {
-        // This shift is full for round 1 — try the other one once more
-        if (roster[iso][otherShift].length >= BASE) break; // both full
-        continue;
-      }
-      const before = roster[iso][shift].length;
-      fillOneSlot(iso, di, wknd, shift, BASE);
-      if (roster[iso][shift].length === before) {
-        // Couldn't fill — no eligible staff left for this shift.
-        // Mark as exhausted by forcing length check past BASE to exit loop for this shift only.
-        // We do this by checking total eligible remaining; if none, break entirely.
-        const stillEligible = ["D","E"].some(sh=>{
-          if (roster[iso][sh].length>=BASE) return false;
-          return activeStaff.some(s=>canWorkForFill(s,iso,sh));
-        });
-        if (!stillEligible) break;
-      }
-    }
-
-    // Round 2: overflow — fill remaining hours-deficit staff up to CEILING,
-    // alternating D/E so overflow is also balanced
-    round = 0;
-    while (roster[iso].D.length < CEILING || roster[iso].E.length < CEILING) {
-      const shift = round % 2 === 0 ? "D" : "E";
-      round++;
-      if (roster[iso][shift].length >= CEILING) {
-        if (roster[iso].D.length>=CEILING && roster[iso].E.length>=CEILING) break;
-        continue;
-      }
-      const before = roster[iso][shift].length;
-      fillOneSlot(iso, di, wknd, shift, CEILING, true);
-      if (roster[iso][shift].length === before) {
-        const stillEligible = ["D","E"].some(sh=>{
-          if (roster[iso][sh].length>=CEILING) return false;
-          return activeStaff.some(s=>canWorkForFill(s,iso,sh));
-        });
-        if (!stillEligible) break;
-      }
-    }
-  }
-
+  // ── Helpers ───────────────────────────────────────────────
   function canWorkForFill(s, iso, shift) {
     if (s.permNights) return false;
-    // Staff in night plan for this fortnight work nights only —
-    // UNLESS they were bumped to D/E for the whole fortnight via surplus resolution
     if (inNightPlanThisFn.has(s.id) && !bumpedFromNights.has(s.id)) return false;
     return canWork(s, iso, shift);
   }
 
-  function fillOneSlot(iso, di, wknd, shift, cap, overflowOnly=false) {
-    const isNUMSlot = shift==="D" && di>=1 && di<=3 && !numHasWorked;
-    const eligible = activeStaff.filter(s => {
-      if (!canWorkForFill(s, iso, shift)) return false;
-      if (overflowOnly && hw[s.id] >= periodTarget[s.id]) return false; // overflow only for hours-deficit
-      return true;
-    }).sort((a,b) => {
-      const aReq = !!(a.requests?.[`${iso}_${shift}`]);
-      const bReq = !!(b.requests?.[`${iso}_${shift}`]);
-      if (aReq && !bReq) return -1;
-      if (!aReq && bReq) return  1;
-      if (wknd) {
-        const dw = (wkndCnt[a.id]||0) - (wkndCnt[b.id]||0);
-        if (dw !== 0) return dw;
-      }
-      const rA=rotScore(a.id,iso,shift), rB=rotScore(b.id,iso,shift);
-      if (rA !== rB) return rA - rB;
-      return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
-    });
-
-    for (const s of eligible) {
-      if (roster[iso][shift].length >= cap) return;
-      if (s.cls==="NUM") {
-        if (!isNUMSlot||numHasWorked) continue;
-      }
-      if (s.cls==="ANUM") {
-        const anumAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="ANUM");
-        if (anumAlready) continue;
-        const numAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="NUM");
-        if (numAlready) continue;
-      }
-      if (s.cls==="EN") {
-        const enAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="EN");
-        if (enAlready) continue;
-      }
-      if (s.cls==="GNP") {
-        const gnpCount = roster[iso][shift].filter(id=>activeStaff.find(x=>x.id===id)?.cls==="GNP").length;
-        if (gnpCount >= maxGNPShift) continue;
-      }
-
-      roster[iso][shift].push(s.id);
-      hw[s.id] += 8;
-      shiftCount[s.id]++;
-      if (wknd) wkndCnt[s.id] = (wkndCnt[s.id]||0)+1;
-      if (s.cls==="NUM") numHasWorked = true;
-      return; // filled one slot, exit
+  function classOk(s, iso, shift) {
+    if (s.cls==="NUM") {
+      const di=dayIdx(iso);
+      if (shift!=="D"||di<1||di>3||numHasWorked) return false;
     }
+    if (s.cls==="ANUM") {
+      if (roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="ANUM")) return false;
+      if (roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="NUM"))  return false;
+    }
+    if (s.cls==="EN") {
+      if (roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="EN")) return false;
+    }
+    if (s.cls==="GNP") {
+      const gc=roster[iso][shift].filter(id=>activeStaff.find(x=>x.id===id)?.cls==="GNP").length;
+      if (gc>=maxGNPShift) return false;
+    }
+    return true;
   }
 
-  // Ensure in-charge coverage after balanced fill
-  function ensureInCharge(iso, shift, wknd) {
-    const hasIC = roster[iso][shift].some(id=>{
-      const x=activeStaff.find(y=>y.id===id); return x&&isInCharge(x);
-    });
-    if (hasIC || roster[iso][shift].length===0) return;
-    const ic = activeStaff.find(s =>
-      !roster[iso][shift].includes(s.id) &&
-      isInCharge(s) &&
-      canWorkForFill(s, iso, shift)
+  function assignSlot(s, iso, shift, cap, wknd=false) {
+    if (!canWorkForFill(s,iso,shift)) return false;
+    if (!classOk(s,iso,shift)) return false;
+    if (roster[iso][shift].length >= cap) return false;
+    if (hw[s.id]+8 > periodTarget[s.id]) return false;
+    roster[iso][shift].push(s.id);
+    hw[s.id]+=8; shiftCount[s.id]++;
+    if (wknd) wkndCnt[s.id]=(wkndCnt[s.id]||0)+1;
+    if (s.cls==="NUM") numHasWorked=true;
+    return true;
+  }
+
+  function ensureIC(iso, shift, wknd=false) {
+    const hasIC=roster[iso][shift].some(id=>{const x=activeStaff.find(y=>y.id===id);return x&&isInCharge(x);});
+    if (hasIC||roster[iso][shift].length===0) return;
+    const ic=activeStaff.find(s=>
+      !roster[iso][shift].includes(s.id)&&isInCharge(s)&&
+      canWorkForFill(s,iso,shift)&&classOk(s,iso,shift)&&
+      hw[s.id]+8<=periodTarget[s.id]
     );
-    if (ic) {
-      roster[iso][shift].push(ic.id);
-      hw[ic.id] += 8;
-      shiftCount[ic.id]++;
-      if (wknd) wkndCnt[ic.id] = (wkndCnt[ic.id]||0)+1;
-    }
+    if (ic) { roster[iso][shift].push(ic.id); hw[ic.id]+=8; shiftCount[ic.id]++; if(wknd)wkndCnt[ic.id]=(wkndCnt[ic.id]||0)+1; }
   }
 
-  // Run shifts in priority order — weekends first, then Mon/Fri, then mid-week
-  orderedDays.forEach(({iso, di, wknd}) => {
-    fillDayBalanced(iso, di, wknd);
-    ensureInCharge(iso, "D", wknd);
-    ensureInCharge(iso, "E", wknd);
+  function bestCandidates(iso, shift, wknd, cap) {
+    return activeStaff
+      .filter(s=>canWorkForFill(s,iso,shift)&&classOk(s,iso,shift)&&roster[iso][shift].length<cap&&hw[s.id]+8<=periodTarget[s.id])
+      .sort((a,b)=>{
+        const aR=!!(a.requests?.[`${iso}_${shift}`]), bR=!!(b.requests?.[`${iso}_${shift}`]);
+        if(aR&&!bR)return -1; if(!aR&&bR)return 1;
+        if(wknd){const dw=(wkndCnt[a.id]||0)-(wkndCnt[b.id]||0);if(dw)return dw;}
+        return (periodTarget[b.id]-hw[b.id])-(periodTarget[a.id]-hw[a.id]);
+      });
+  }
+
+  function blockScore(sId, iso) {
+    const p1=isoDate(addDays(parseLocalDate(iso),-1));
+    const n1=isoDate(addDays(parseLocalDate(iso),1));
+    const p2=isoDate(addDays(parseLocalDate(iso),-2));
+    const n2=isoDate(addDays(parseLocalDate(iso),2));
+    const worked = k => roster[k]?.D.includes(sId)||roster[k]?.E.includes(sId)||roster[k]?.N.includes(sId)||prevTail[k]?.D?.includes(sId)||prevTail[k]?.E?.includes(sId);
+    let score=0;
+    if(worked(p1))score+=3; if(worked(n1))score+=3;
+    if(worked(p2))score+=1; if(worked(n2))score+=1;
+    return score;
+  }
+
+  const priorityDays = [...days.filter(d=>d.wknd), ...days.filter(d=>!d.wknd&&(d.di===0||d.di===4))];
+  const midWeekDays  = days.filter(d=>!d.wknd&&d.di!==0&&d.di!==4);
+
+  // ── PASS 1: Priority fill (weekends + Mon/Fri) ────────────
+  priorityDays.forEach(({iso, di, wknd}) => {
+    const BASE = wknd ? 9 : 10;
+    let round=0, stuck=0;
+    while ((roster[iso].D.length<BASE||roster[iso].E.length<BASE) && stuck<40) {
+      const sh=round%2===0?"D":"E"; round++;
+      if (roster[iso][sh].length>=BASE){stuck++;continue;}
+      const prev=roster[iso][sh].length;
+      const cand=bestCandidates(iso,sh,wknd,BASE)[0];
+      if(cand) assignSlot(cand,iso,sh,BASE,wknd);
+      if(roster[iso][sh].length===prev) stuck++; else stuck=0;
+    }
+    ensureIC(iso,"D",wknd); ensureIC(iso,"E",wknd);
   });
+
+  // ── PASS 2: Pre-allocate mid-week with block preference ───
+  // Calculate each person's remaining shifts needed
+  const midWeekNeed={};
+  deEligibleStaff.forEach(s=>{
+    midWeekNeed[s.id]=Math.floor(Math.max(0,periodTarget[s.id]-hw[s.id])/8);
+  });
+
+  // Sort staff: most constrained first (need / available days ratio)
+  const midWeekElig = deEligibleStaff
+    .filter(s=>(midWeekNeed[s.id]||0)>0)
+    .sort((a,b)=>{
+      const avA=midWeekDays.filter(d=>canWorkForFill(a,d.iso,"D")||canWorkForFill(a,d.iso,"E")).length||1;
+      const avB=midWeekDays.filter(d=>canWorkForFill(b,d.iso,"D")||canWorkForFill(b,d.iso,"E")).length||1;
+      return (midWeekNeed[b.id]/avB)-(midWeekNeed[a.id]/avA);
+    });
+
+  midWeekElig.forEach(s=>{
+    let needed=midWeekNeed[s.id]||0;
+    if(!needed)return;
+    // Score all available mid-week day+shift combos
+    const opts=[];
+    midWeekDays.forEach(({iso})=>{
+      ["D","E"].forEach(sh=>{
+        if(!canWorkForFill(s,iso,sh))return;
+        if(!classOk(s,iso,sh))return;
+        if(roster[iso][sh].length>=WEEKDAY_CEILING)return;
+        if(hw[s.id]+8>periodTarget[s.id])return;
+        // Prefer E slightly to balance with Pass 1 which fills D first on priority days
+        const shPref=sh==="E"?0.5:0;
+        opts.push({iso,sh,score:blockScore(s.id,iso)+shPref});
+      });
+    });
+    opts.sort((a,b)=>b.score-a.score);
+    let assigned=0;
+    for(const {iso,sh} of opts){
+      if(assigned>=needed)break;
+      if(assignSlot(s,iso,sh,WEEKDAY_CEILING,false)) assigned++;
+    }
+  });
+
+  // Top up mid-week shifts to BASE if under, then ensure IC
+  midWeekDays.forEach(({iso})=>{
+    ["D","E"].forEach(sh=>{
+      let stuck=0;
+      while(roster[iso][sh].length<10&&stuck<20){
+        const cand=bestCandidates(iso,sh,false,WEEKDAY_CEILING)[0];
+        if(!cand){stuck++;break;}
+        assignSlot(cand,iso,sh,WEEKDAY_CEILING,false);
+        stuck=0;
+      }
+      ensureIC(iso,sh,false);
+    });
+  });
+
+  // ── PASS 3: Refinement — fix isolated shifts ──────────────
+  for(let p=0;p<3;p++){
+    activeStaff.forEach(s=>{
+      if(s.permNights||(inNightPlanThisFn.has(s.id)&&!bumpedFromNights.has(s.id)))return;
+      days.forEach(({iso,wknd})=>{
+        if(!roster[iso].D.includes(s.id)&&!roster[iso].E.includes(s.id))return;
+        const p1=isoDate(addDays(parseLocalDate(iso),-1));
+        const n1=isoDate(addDays(parseLocalDate(iso),1));
+        const worked=k=>roster[k]?.D.includes(s.id)||roster[k]?.E.includes(s.id)||roster[k]?.N.includes(s.id)||leaveMap[s.id]?.[k];
+        if(worked(p1)||worked(n1))return; // not isolated
+        // Try to add adjacent day to fix isolation
+        const sh=roster[iso].D.includes(s.id)?"D":"E";
+        for(const fixIso of[p1,n1]){
+          if(!roster[fixIso])continue;
+          if(hw[s.id]+8>periodTarget[s.id])break;
+          const fixWknd=isWknd(fixIso);
+          const cap=fixWknd?9:WEEKDAY_CEILING;
+          for(const trySh of[sh,sh==="D"?"E":"D"]){
+            if(assignSlot(s,fixIso,trySh,cap,fixWknd)) break;
+          }
+          if(worked(fixIso))break;
+        }
+      });
+    });
+  }
 
   // Merge ADO into leaveMap for display
   activeStaff.forEach(s=>{ Object.keys(adoMap[s.id]).forEach(iso=>{ leaveMap[s.id][iso]="ADO"; }); });
