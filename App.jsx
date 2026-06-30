@@ -521,16 +521,43 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     const anums   = onShiftStaff.filter(s => s.cls === "ANUM");
     const icCapable = onShiftStaff.filter(s => isInCharge(s) && s.cls !== "ANUM");
     if (anums.length >= 1) {
-      // ANUM present: need at least 1 additional in-charge capable non-ANUM
       return icCapable.length >= 1;
     } else {
-      // No ANUM: need at least 2 in-charge capable non-ANUM
       return icCapable.length >= 2;
     }
   }
 
+  // ── Week-balanced night targets ───────────────────────────
+  // For rotating staff: split their total nights roughly half week1/half week2
+  // (give or take 1 shift), to avoid front-loading one week and leaving gaps.
+  const week1Days = days.filter(d => d.wk === 0);
+  const week2Days = days.filter(d => d.wk === 1);
+  const nightWeekTarget = {}; // staffId -> { w1: targetShifts, w2: targetShifts }
+  activeStaff.forEach(s => {
+    if (s.permNights || bumpedFromNights.has(s.id)) return;
+    const totalShifts = Math.floor(nightHoursCeiling[s.id] / 10);
+    const w1 = Math.ceil(totalShifts / 2);
+    const w2 = totalShifts - w1;
+    nightWeekTarget[s.id] = { w1, w2, assignedW1: 0, assignedW2: 0 };
+  });
+
+  // Helper: does this person have a 2-3 day rest block coming up if we
+  // assign them tonight? We avoid more than 4 consecutive nights and
+  // try to ensure when they DO stop, they get 2-3 days off before
+  // the next block (handled by canWork's consecNights check + this scoring).
+  function nightAssignScore(s, iso, wk) {
+    if (s.permNights) return 0; // perm nights always score equally
+    const target = nightWeekTarget[s.id];
+    if (!target) return 0;
+    const assignedThisWeek = wk === 0 ? target.assignedW1 : target.assignedW2;
+    const targetThisWeek    = wk === 0 ? target.w1 : target.w2;
+    // Strongly prefer staff who are behind their target for this week
+    const deficit = targetThisWeek - assignedThisWeek;
+    return deficit; // higher deficit = higher priority
+  }
+
   // ── PHASE 1: Night shifts ─────────────────────────────────
-  const nightInChargeMissing = new Set(); // iso dates where in-charge coverage not met
+  const nightInChargeMissing = new Set();
 
   days.forEach(({iso, wk}) => {
     const eligible = activeStaff
@@ -538,6 +565,10 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       .sort((a,b) => {
         if (a.permNights && !b.permNights) return -1;
         if (!a.permNights && b.permNights) return  1;
+        // Week-balance priority: staff behind their week target go first
+        const scoreA = nightAssignScore(a, iso, wk);
+        const scoreB = nightAssignScore(b, iso, wk);
+        if (scoreA !== scoreB) return scoreB - scoreA;
         return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
       });
 
@@ -574,6 +605,10 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       hw[s.id] += 10;
       shiftCount[s.id]++;
       nightHrsAssigned[s.id] += 10;
+      if (nightWeekTarget[s.id]) {
+        if (wk === 0) nightWeekTarget[s.id].assignedW1++;
+        else nightWeekTarget[s.id].assignedW2++;
+      }
     }
 
     // In-charge coverage enforcement
@@ -601,6 +636,10 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
           hw[ic.id] += 10;
           shiftCount[ic.id]++;
           nightHrsAssigned[ic.id] += 10;
+          if (nightWeekTarget[ic.id]) {
+            if (wk === 0) nightWeekTarget[ic.id].assignedW1++;
+            else nightWeekTarget[ic.id].assignedW2++;
+          }
         } else {
           nightInChargeMissing.add(iso);
         }
@@ -1319,7 +1358,7 @@ export default function App() {
         {tab==="generate" &&<GenerateTab cfg={genCfg} setCfg={setGenCfg} onGenerate={handleGenerate} staff={staff} nightPlanData={nightPlanData} rosters={rosters} onSuggestDate={suggestNextStartDate}/>}
         {tab==="staff"    &&<StaffTab    staff={staff} setStaff={setStaff} toast={toast}/>}
         {tab==="leave"    &&<LeaveTab    staff={staff} setStaff={setStaff} toast={toast}/>}
-        {tab==="nightplan"&&<NightPlanTab staff={staff} nightPlanData={nightPlanData} setNightPlanData={setNightPlanData} toast={toast}/>}
+        {tab==="nightplan"&&<NightPlanTab staff={staff} nightPlanData={nightPlanData} setNightPlanData={setNightPlanData} toast={toast} rosters={rosters}/>}
         {tab==="ado"      &&<ADOTab      staff={staff} rosters={rosters} adoAdjustments={adoAdjustments} setAdoAdjustments={setAdoAdjustments} toast={toast}/>}
         {tab==="history"  &&<HistoryTab  rosters={rosters} staff={staff} activeKey={activeKey} setActiveKey={setActiveKey} setTab={setTab} onDelete={handleDeleteRoster}/>}
       </div>
@@ -2383,7 +2422,7 @@ function LeaveTab({staff,setStaff,toast}){
 }
 
 // ─── NIGHT PLAN TAB ──────────────────────────────────────────
-function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
+function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
   const [year,setYear]             = useState(new Date().getFullYear());
   const [view,setView]             = useState("planner");
   const [firstMonday,setFirstMonday] = useState(
@@ -2552,15 +2591,12 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
           )}
 
           {/* Bump History Ledger */}
-          {Object.keys(nightPlanData?.bumpHistory||rosters&&Object.values(rosters).reduce((acc,r)=>{
-            Object.entries(r.bumpHistory||{}).forEach(([k,v])=>{acc[k]=(acc[k]||0)+v;});
-            return acc;
-          },{})||{}).length>0&&(()=>{
-            const allBumps=Object.values(rosters).reduce((acc,r)=>{
+          {(()=>{
+            const allBumps = Object.values(rosters||{}).reduce((acc,r)=>{
               Object.entries(r.bumpHistory||{}).forEach(([k,v])=>{acc[k]=(acc[k]||0)+v;});
               return acc;
             },{});
-            if(!Object.keys(allBumps).length)return null;
+            if(!Object.keys(allBumps).length) return null;
             return(
               <>
                 <h3 style={{...C.sectionH,marginTop:24}}>Night Surplus — Bump History</h3>
