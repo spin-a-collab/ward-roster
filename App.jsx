@@ -188,7 +188,7 @@ function autoAssignNightPlan(staff, year, firstMonday) {
   const plan={}, groupAssignments={};
 
   // Use the provided first Monday, or fall back to first Monday of the year
-  const startMon = firstMonday ? getMon(new Date(firstMonday)) : getMon(new Date(year,0,1));
+  const startMon = firstMonday ? getMon(parseLocalDate(firstMonday)) : getMon(new Date(year,0,1));
 
   // Build 26 fortnights from that start date
   const fns=Array.from({length:26},(_,i)=>({
@@ -250,7 +250,7 @@ const SAMPLE_STAFF = [
 
 // ─── ROSTER GENERATOR v3 ─────────────────────────────────────
 function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,recentWkndCounts,bumpHistory={}}) {
-  const startMon=getMon(new Date(startDate));
+  const startMon=getMon(parseLocalDate(startDate));
   const days=buildDays(startMon,weeks);
   const roster={};
   days.forEach(d=>{ roster[d.iso]={D:[],E:[],N:[]}; });
@@ -310,12 +310,12 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   function working(sId,iso){ return onShift(sId,iso,"D")||onShift(sId,iso,"E")||onShift(sId,iso,"N"); }
   function assignedToday(sId,iso){ const d=roster[iso]; return !!(d&&(d.D.includes(sId)||d.E.includes(sId)||d.N.includes(sId))); }
 
-  function consecNights(sId,iso){ let c=0; for(let i=1;i<=5;i++){if(onShift(sId,isoDate(addDays(new Date(iso),-i)),"N"))c++;else break;} return c; }
-  function consecShifts(sId,iso){ let c=0; for(let i=1;i<=6;i++){if(working(sId,isoDate(addDays(new Date(iso),-i))))c++;else break;} return c; }
-  function nightWithin47h(sId,iso){ for(let i=1;i<=2;i++){if(onShift(sId,isoDate(addDays(new Date(iso),-i)),"N"))return true;} return false; }
+  function consecNights(sId,iso){ let c=0; for(let i=1;i<=5;i++){if(onShift(sId,isoDate(addDays(parseLocalDate(iso),-i)),"N"))c++;else break;} return c; }
+  function consecShifts(sId,iso){ let c=0; for(let i=1;i<=6;i++){if(working(sId,isoDate(addDays(parseLocalDate(iso),-i))))c++;else break;} return c; }
+  function nightWithin47h(sId,iso){ for(let i=1;i<=2;i++){if(onShift(sId,isoDate(addDays(parseLocalDate(iso),-i)),"N"))return true;} return false; }
 
   function weekHrs(sId,iso,adding){
-    const mon=getMon(new Date(iso)); let tot=adding;
+    const mon=getMon(parseLocalDate(iso)); let tot=adding;
     for(let i=0;i<7;i++){
       const k=isoDate(addDays(mon,i)); if(k===iso)continue;
       if(leaveMap[sId][k]||adoMap[sId][k]){tot+=8;continue;}
@@ -986,7 +986,7 @@ function validateRosterConfig({ staff, startDate, weeks, nightPlanData }) {
     if (!s || s.archived) return false;
     if (s.resign) {
       const rosterEnd = addDays(startMon, weeks * 7 - 1);
-      if (new Date(s.resign) <= new Date(startDate)) return false;
+      if (parseLocalDate(s.resign) <= parseLocalDate(startDate)) return false;
     }
     return true;
   });
@@ -1229,7 +1229,7 @@ export default function App() {
     const r=rosters[lastLocked];
     const lastDay=r.days?.[r.days.length-1];
     if(!lastDay)return;
-    const nextMon=getMon(addDays(new Date(lastDay),1));
+    const nextMon=getMon(addDays(parseLocalDate(lastDay),1));
     setGenCfg(c=>({...c,startDate:isoDate(nextMon)}));
     toast(`Start date set to ${fmtDate(nextMon)} — Monday after the last locked roster`);
   }
@@ -1497,7 +1497,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                   <th style={{...C.th,...C.fix1,minWidth:52}}>Cls</th>
                   <th style={{...C.th,...C.fix2,minWidth:64,borderRight:"2px solid #1a4070"}}>Hrs</th>
                   {days.map(iso=>{
-                    const dt=new Date(iso),di=dayIdx(iso),wknd=di>=5;
+                    const dt=parseLocalDate(iso),di=dayIdx(iso),wknd=di>=5;
                     return(
                       <th key={iso} style={{...C.th,minWidth:36,borderLeft:wknd?"2px solid #2a1030":"1px solid #1a3050",background:wknd?"#130a1a":"#080f1a",color:wknd?"#ce93d8":"#4a7fa0"}}>
                         <div style={{fontSize:8}}>{DAY_NAMES[di]}</div>
@@ -1597,7 +1597,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
               <thead>
                 <tr>
                   <th style={{...C.th,minWidth:70,textAlign:"left",paddingLeft:10}}>Shift</th>
-                  {days.map(iso=>{const dt=new Date(iso),di=dayIdx(iso),wknd=di>=5;
+                  {days.map(iso=>{const dt=parseLocalDate(iso),di=dayIdx(iso),wknd=di>=5;
                     return<th key={iso} style={{...C.th,minWidth:36,fontSize:9,background:wknd?"#130a1a":"#080f1a",color:wknd?"#ce93d8":"#4a7fa0"}}>{DAY_NAMES[di]}<br/>{dt.getDate()}</th>;})}
                 </tr>
               </thead>
@@ -2425,6 +2425,7 @@ function LeaveTab({staff,setStaff,toast}){
 function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
   const [year,setYear]             = useState(new Date().getFullYear());
   const [view,setView]             = useState("planner");
+  const [monthOffset,setMonthOffset] = useState(new Date().getMonth());
   const [firstMonday,setFirstMonday] = useState(
     // Default: first Monday of current year, or stored from previous plan
     ()=> nightPlanData?.firstMonday || isoDate(getMon(new Date(new Date().getFullYear(),0,1)))
@@ -2434,7 +2435,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
   const gc=["#e53935","#fb8c00","#fdd835","#43a047","#1e88e5","#8e24aa","#00acc1","#f06292","#00897b","#6d4c41"];
 
   // Validate firstMonday is actually a Monday
-  const firstMondayValid = firstMonday && new Date(firstMonday).getDay() === 1;
+  const firstMondayValid = firstMonday && parseLocalDate(firstMonday).getDay() === 1;
 
   function autoGen(){
     if(!firstMondayValid){
@@ -2647,15 +2648,29 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
       )}
 
       {/* ── ANNUAL TIMELINE VIEW ── */}
-      {view==="timeline"&&(
+      {view==="timeline"&&(()=>{
+        const viewMonths=[0,1]; // show 2 months at a time for performance
+
+        return(
         <div>
           <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
             <div style={{display:"flex",gap:8,alignItems:"center",background:"#0a1828",borderRadius:8,border:"1px solid #1a3050",padding:"6px 12px"}}>
-              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y-1)}>‹</button>
+              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y-1)}>‹ Year</button>
               <strong style={{color:"#a8dadc",fontSize:16,minWidth:44,textAlign:"center"}}>{year}</strong>
-              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y+1)}>›</button>
+              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y+1)}>Year ›</button>
+            </div>
+            <div style={{display:"flex",gap:8,alignItems:"center",background:"#0a1828",borderRadius:8,border:"1px solid #1a3050",padding:"6px 12px"}}>
+              <button style={C.weekNavBtn} onClick={()=>setMonthOffset(m=>Math.max(0,m-2))}>‹ Prev 2mo</button>
+              <strong style={{color:"#7fb3d3",fontSize:13,minWidth:120,textAlign:"center"}}>
+                {MONTH_NAMES[monthOffset%12]} – {MONTH_NAMES[(monthOffset+1)%12]}
+              </strong>
+              <button style={C.weekNavBtn} onClick={()=>setMonthOffset(m=>Math.min(10,m+2))}>Next 2mo ›</button>
             </div>
             {!nightPlanData&&<span style={{fontSize:11,color:"#ef5350"}}>⚠ No night plan generated — go to Planner tab first</span>}
+          </div>
+
+          <div style={{fontSize:10,color:"#2a6080",marginBottom:10}}>
+            Showing 2 months at a time for performance. Use Prev/Next to scroll through the year.
           </div>
 
           {/* Group colour legend */}
@@ -2679,36 +2694,44 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
             </div>
           )}
 
-          {/* Timeline grid — months across top, staff down the side */}
+          {/* Timeline grid — 2 months at a time, staff down the side */}
           {nightPlanData&&(()=>{
-            // Build a day-level map: iso -> groupId (or "perm" for perm nights)
+            // Build a day-level map only for the visible 2-month window
             const dayMap={};
-            yearFns.forEach(fn=>{
+            const windowStart=new Date(year,monthOffset,1);
+            const windowEnd=new Date(year,monthOffset+2,0); // last day of 2nd month
+            (nightPlanData.fns||[]).forEach(fn=>{
               const gid=nightPlanData.groupAssignments?.[fn.key];
               if(!gid)return;
+              const fnStart=parseLocalDate(typeof fn.start==="string"?fn.start.split("T")[0]:isoDate(fn.start));
               for(let d=0;d<14;d++){
-                const iso=isoDate(addDays(fn.start,d));
-                if(new Date(iso).getFullYear()===year) dayMap[iso]=gid;
+                const dt=addDays(fnStart,d);
+                if(dt>=windowStart&&dt<=windowEnd){
+                  dayMap[isoDate(dt)]=gid;
+                }
               }
             });
-            // Perm nights always show
-            permStaff.forEach(s=>{ /* handled by row rendering */ });
 
-            // All staff who appear in any night group or are perm nights
             const nightStaff=[
               ...permStaff,
               ...(nightPlanData.groups||[]).flatMap(g=>
                 staff.filter(s=>g.members.includes(s.id)&&!s.permNights)
               ),
-            ].filter((s,i,arr)=>arr.findIndex(x=>x.id===s.id)===i); // dedupe
+            ].filter((s,i,arr)=>arr.findIndex(x=>x.id===s.id)===i);
 
-            // Build month columns: Jan–Dec, each month = array of days in that month for this year
-            const months=Array.from({length:12},(_,m)=>{
+            // Build only the 2 visible months
+            const months=viewMonths.map(offset=>{
+              const m=monthOffset+offset;
               const days=[];
               let d=new Date(year,m,1);
-              while(d.getMonth()===m){ days.push(isoDate(d)); d=addDays(d,1); }
-              return {month:m,label:MONTH_NAMES[m],days};
+              const targetMonth=((m%12)+12)%12;
+              while(d.getMonth()===targetMonth){ days.push(isoDate(d)); d=addDays(d,1); }
+              return {month:targetMonth,label:MONTH_NAMES[targetMonth],days};
             });
+
+            if(nightStaff.length===0){
+              return <div style={{color:"#2a5070",fontSize:12,padding:16}}>No staff assigned to night groups yet.</div>;
+            }
 
             return(
               <div style={{overflowX:"auto"}}>
@@ -2720,22 +2743,21 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
                         <th key={month} colSpan={days.length} style={{
                           ...C.th,background:"#060e18",color:"#4fc3f7",
                           borderLeft:"2px solid #1a3050",fontSize:11,padding:"6px 4px",
-                          minWidth:days.length*12,
+                          minWidth:days.length*14,
                         }}>{label}</th>
                       ))}
                     </tr>
-                    {/* Day numbers row */}
                     <tr>
                       <th style={{...C.th,position:"sticky",left:0,background:"#06101a",zIndex:4}}/>
                       {months.flatMap(({days})=>days.map(iso=>{
-                        const dt=new Date(iso); const di=dayIdx(iso); const wknd=di>=5;
+                        const dt=parseLocalDate(iso); const di=dayIdx(iso); const wknd=di>=5;
                         return(
                           <th key={iso} style={{
-                            ...C.th,minWidth:12,maxWidth:12,padding:"2px 0",fontSize:7,
+                            ...C.th,minWidth:14,maxWidth:14,padding:"2px 0",fontSize:8,
                             background:wknd?"#130a1a":"#080f1a",
                             color:wknd?"#3a1a50":"#2a5070",
                             borderLeft:dt.getDate()===1?"2px solid #1a3050":"none",
-                          }}>{dt.getDate()===1||dt.getDate()%5===0?dt.getDate():""}</th>
+                          }}>{dt.getDate()}</th>
                         );
                       }))}
                     </tr>
@@ -2743,7 +2765,6 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
                   <tbody>
                     {nightStaff.map((s,ri)=>{
                       const cls=CLASSIFICATIONS[s.cls];
-                      // Find which group this staff belongs to
                       const staffGroup=nightPlanData.groups?.find(g=>g.members.includes(s.id));
                       const staffGroupColor=staffGroup?gc[staffGroup.id-1]||"#64b5f6":null;
 
@@ -2762,8 +2783,8 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
                             </div>
                           </td>
                           {months.flatMap(({days})=>days.map(iso=>{
-                            const dt=new Date(iso);
-                            const isNightBlock = s.permNights || (nightPlanData.plan?.[s.id]?.[iso]);
+                            const dt=parseLocalDate(iso);
+                            const isNightBlock = s.permNights || !!(nightPlanData.plan?.[s.id]?.[iso]);
                             const gid=isNightBlock&&!s.permNights?dayMap[iso]:null;
                             const color=s.permNights?"#3949ab":(gid?gc[gid-1]||"#64b5f6":null);
                             const wknd=dayIdx(iso)>=5;
@@ -2771,9 +2792,9 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
                               <td key={iso} style={{
                                 ...C.td,
                                 padding:0,
-                                minWidth:12,maxWidth:12,
+                                minWidth:14,maxWidth:14,
                                 background:isNightBlock
-                                  ?(color+"99"||"#1a237e99")
+                                  ?(color?color+"99":"#1a237e99")
                                   :wknd?"#0d0814":"transparent",
                                 borderLeft:dt.getDate()===1?"2px solid #1a3050":"none",
                                 borderBottom:"1px solid #0a1525",
@@ -2786,7 +2807,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
                   </tbody>
                 </table>
                 <div style={{fontSize:10,color:"#2a5070",marginTop:10}}>
-                  Each column = 1 day. Coloured blocks = night shifts assigned. Scroll horizontally to see the full year.
+                  Each column = 1 day. Coloured blocks = night shifts assigned.
                 </div>
               </div>
             );
@@ -2801,7 +2822,8 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
             </div>
           )}
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
