@@ -188,7 +188,7 @@ function autoAssignNightPlan(staff, year, firstMonday) {
   const plan={}, groupAssignments={};
 
   // Use the provided first Monday, or fall back to first Monday of the year
-  const startMon = firstMonday ? getMon(new Date(firstMonday)) : getMon(new Date(year,0,1));
+  const startMon = firstMonday ? getMon(parseLocalDate(firstMonday)) : getMon(new Date(year,0,1));
 
   // Build 26 fortnights from that start date
   const fns=Array.from({length:26},(_,i)=>({
@@ -250,7 +250,7 @@ const SAMPLE_STAFF = [
 
 // ─── ROSTER GENERATOR v3 ─────────────────────────────────────
 function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,recentWkndCounts,bumpHistory={}}) {
-  const startMon=getMon(new Date(startDate));
+  const startMon=getMon(parseLocalDate(startDate));
   const days=buildDays(startMon,weeks);
   const roster={};
   days.forEach(d=>{ roster[d.iso]={D:[],E:[],N:[]}; });
@@ -310,12 +310,12 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
   function working(sId,iso){ return onShift(sId,iso,"D")||onShift(sId,iso,"E")||onShift(sId,iso,"N"); }
   function assignedToday(sId,iso){ const d=roster[iso]; return !!(d&&(d.D.includes(sId)||d.E.includes(sId)||d.N.includes(sId))); }
 
-  function consecNights(sId,iso){ let c=0; for(let i=1;i<=5;i++){if(onShift(sId,isoDate(addDays(new Date(iso),-i)),"N"))c++;else break;} return c; }
-  function consecShifts(sId,iso){ let c=0; for(let i=1;i<=6;i++){if(working(sId,isoDate(addDays(new Date(iso),-i))))c++;else break;} return c; }
-  function nightWithin47h(sId,iso){ for(let i=1;i<=2;i++){if(onShift(sId,isoDate(addDays(new Date(iso),-i)),"N"))return true;} return false; }
+  function consecNights(sId,iso){ let c=0; for(let i=1;i<=5;i++){if(onShift(sId,isoDate(addDays(parseLocalDate(iso),-i)),"N"))c++;else break;} return c; }
+  function consecShifts(sId,iso){ let c=0; for(let i=1;i<=6;i++){if(working(sId,isoDate(addDays(parseLocalDate(iso),-i))))c++;else break;} return c; }
+  function nightWithin47h(sId,iso){ for(let i=1;i<=2;i++){if(onShift(sId,isoDate(addDays(parseLocalDate(iso),-i)),"N"))return true;} return false; }
 
   function weekHrs(sId,iso,adding){
-    const mon=getMon(new Date(iso)); let tot=adding;
+    const mon=getMon(parseLocalDate(iso)); let tot=adding;
     for(let i=0;i<7;i++){
       const k=isoDate(addDays(mon,i)); if(k===iso)continue;
       if(leaveMap[sId][k]||adoMap[sId][k]){tot+=8;continue;}
@@ -521,16 +521,43 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     const anums   = onShiftStaff.filter(s => s.cls === "ANUM");
     const icCapable = onShiftStaff.filter(s => isInCharge(s) && s.cls !== "ANUM");
     if (anums.length >= 1) {
-      // ANUM present: need at least 1 additional in-charge capable non-ANUM
       return icCapable.length >= 1;
     } else {
-      // No ANUM: need at least 2 in-charge capable non-ANUM
       return icCapable.length >= 2;
     }
   }
 
+  // ── Week-balanced night targets ───────────────────────────
+  // For rotating staff: split their total nights roughly half week1/half week2
+  // (give or take 1 shift), to avoid front-loading one week and leaving gaps.
+  const week1Days = days.filter(d => d.wk === 0);
+  const week2Days = days.filter(d => d.wk === 1);
+  const nightWeekTarget = {}; // staffId -> { w1: targetShifts, w2: targetShifts }
+  activeStaff.forEach(s => {
+    if (s.permNights || bumpedFromNights.has(s.id)) return;
+    const totalShifts = Math.floor(nightHoursCeiling[s.id] / 10);
+    const w1 = Math.ceil(totalShifts / 2);
+    const w2 = totalShifts - w1;
+    nightWeekTarget[s.id] = { w1, w2, assignedW1: 0, assignedW2: 0 };
+  });
+
+  // Helper: does this person have a 2-3 day rest block coming up if we
+  // assign them tonight? We avoid more than 4 consecutive nights and
+  // try to ensure when they DO stop, they get 2-3 days off before
+  // the next block (handled by canWork's consecNights check + this scoring).
+  function nightAssignScore(s, iso, wk) {
+    if (s.permNights) return 0; // perm nights always score equally
+    const target = nightWeekTarget[s.id];
+    if (!target) return 0;
+    const assignedThisWeek = wk === 0 ? target.assignedW1 : target.assignedW2;
+    const targetThisWeek    = wk === 0 ? target.w1 : target.w2;
+    // Strongly prefer staff who are behind their target for this week
+    const deficit = targetThisWeek - assignedThisWeek;
+    return deficit; // higher deficit = higher priority
+  }
+
   // ── PHASE 1: Night shifts ─────────────────────────────────
-  const nightInChargeMissing = new Set(); // iso dates where in-charge coverage not met
+  const nightInChargeMissing = new Set();
 
   days.forEach(({iso, wk}) => {
     const eligible = activeStaff
@@ -538,6 +565,10 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       .sort((a,b) => {
         if (a.permNights && !b.permNights) return -1;
         if (!a.permNights && b.permNights) return  1;
+        // Week-balance priority: staff behind their week target go first
+        const scoreA = nightAssignScore(a, iso, wk);
+        const scoreB = nightAssignScore(b, iso, wk);
+        if (scoreA !== scoreB) return scoreB - scoreA;
         return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
       });
 
@@ -574,6 +605,10 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
       hw[s.id] += 10;
       shiftCount[s.id]++;
       nightHrsAssigned[s.id] += 10;
+      if (nightWeekTarget[s.id]) {
+        if (wk === 0) nightWeekTarget[s.id].assignedW1++;
+        else nightWeekTarget[s.id].assignedW2++;
+      }
     }
 
     // In-charge coverage enforcement
@@ -601,6 +636,10 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
           hw[ic.id] += 10;
           shiftCount[ic.id]++;
           nightHrsAssigned[ic.id] += 10;
+          if (nightWeekTarget[ic.id]) {
+            if (wk === 0) nightWeekTarget[ic.id].assignedW1++;
+            else nightWeekTarget[ic.id].assignedW2++;
+          }
         } else {
           nightInChargeMissing.add(iso);
         }
@@ -629,158 +668,196 @@ function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,rece
     });
   });
 
-  // ── PHASE 2: Day & Evening ────────────────────────────────
-  // PRIORITY ORDER for filling shifts:
-  //   1. Weekend days (Sat/Sun) — fill these first across all staff
-  //   2. Monday and Friday — priority weekdays
-  //   3. Tuesday, Wednesday, Thursday — fill last (overstaffing allowed here)
+  // ── PHASE 2: Day & Evening — Three-Pass Approach ────────────
   //
-  // Within each priority tier, process D and E shifts.
-  // This ensures high-priority days are fully staffed before mid-week
-  // uses up staff shift allowances.
+  // PASS 1: Priority fill — weekends + Mon/Fri to BASE
+  // PASS 2: Pre-allocate mid-week using block preference scoring
+  // PASS 3: Refinement — fix isolated shifts by adding adjacent days
 
-  // Build day lists in priority order
-  const weekendDays = days.filter(d => d.wknd);
-  const monFriDays  = days.filter(d => !d.wknd && (d.di===0||d.di===4)); // Mon=0,Fri=4
-  const midWeekDays = days.filter(d => !d.wknd && d.di!==0 && d.di!==4);
-  const orderedDays = [...weekendDays, ...monFriDays, ...midWeekDays];
+  // ── Dynamic ceiling ──────────────────────────────────────
+  const deEligibleStaff = activeStaff.filter(s =>
+    !s.permNights && (!inNightPlanThisFn.has(s.id) || bumpedFromNights.has(s.id))
+  );
+  const totalDEshifts = deEligibleStaff.reduce((sum,s) => {
+    const leaveHrs = days.filter(d => leaveMap[s.id]?.[d.iso]).length * 8;
+    return sum + Math.max(0, Math.floor((periodTarget[s.id] - leaveHrs) / 8));
+  }, 0);
+  const weekdayCount = days.filter(d=>!d.wknd).length;
+  const weekendCount = days.filter(d=>d.wknd).length;
+  const totalSlots   = weekdayCount * 20 + weekendCount * 18; // 2 shifts × staffing target per day
+  const surplusDE    = Math.max(0, totalDEshifts - totalSlots);
+  const surplusPerSlot = weekdayCount > 0 ? surplusDE / (weekdayCount * 2) : 0;
+  const WEEKDAY_CEILING = Math.min(14, Math.round(10 + surplusPerSlot));
 
-  // ── Fill D and E TOGETHER per day, alternating, so neither shift
-  // starves the other of available staff hours. Within each day we
-  // fill one slot of D, then one slot of E, then back to D, etc.,
-  // up to each shift's base target — THEN allow overflow if hours remain.
-  function fillDayBalanced(iso, di, wknd) {
-    const BASE = wknd ? 9 : 10;
-    const CEILING = wknd ? BASE : BASE + 2;
-
-    // Round 1: alternately fill D and E up to BASE each, balanced
-    let round = 0;
-    while (roster[iso].D.length < BASE || roster[iso].E.length < BASE) {
-      const shift = round % 2 === 0 ? "D" : "E";
-      const otherShift = shift === "D" ? "E" : "D";
-      round++;
-      if (roster[iso][shift].length >= BASE) {
-        // This shift is full for round 1 — try the other one once more
-        if (roster[iso][otherShift].length >= BASE) break; // both full
-        continue;
-      }
-      const before = roster[iso][shift].length;
-      fillOneSlot(iso, di, wknd, shift, BASE);
-      if (roster[iso][shift].length === before) {
-        // Couldn't fill — no eligible staff left for this shift.
-        // Mark as exhausted by forcing length check past BASE to exit loop for this shift only.
-        // We do this by checking total eligible remaining; if none, break entirely.
-        const stillEligible = ["D","E"].some(sh=>{
-          if (roster[iso][sh].length>=BASE) return false;
-          return activeStaff.some(s=>canWorkForFill(s,iso,sh));
-        });
-        if (!stillEligible) break;
-      }
-    }
-
-    // Round 2: overflow — fill remaining hours-deficit staff up to CEILING,
-    // alternating D/E so overflow is also balanced
-    round = 0;
-    while (roster[iso].D.length < CEILING || roster[iso].E.length < CEILING) {
-      const shift = round % 2 === 0 ? "D" : "E";
-      round++;
-      if (roster[iso][shift].length >= CEILING) {
-        if (roster[iso].D.length>=CEILING && roster[iso].E.length>=CEILING) break;
-        continue;
-      }
-      const before = roster[iso][shift].length;
-      fillOneSlot(iso, di, wknd, shift, CEILING, true);
-      if (roster[iso][shift].length === before) {
-        const stillEligible = ["D","E"].some(sh=>{
-          if (roster[iso][sh].length>=CEILING) return false;
-          return activeStaff.some(s=>canWorkForFill(s,iso,sh));
-        });
-        if (!stillEligible) break;
-      }
-    }
-  }
-
+  // ── Helpers ───────────────────────────────────────────────
   function canWorkForFill(s, iso, shift) {
     if (s.permNights) return false;
-    // Staff in night plan for this fortnight work nights only —
-    // UNLESS they were bumped to D/E for the whole fortnight via surplus resolution
     if (inNightPlanThisFn.has(s.id) && !bumpedFromNights.has(s.id)) return false;
     return canWork(s, iso, shift);
   }
 
-  function fillOneSlot(iso, di, wknd, shift, cap, overflowOnly=false) {
-    const isNUMSlot = shift==="D" && di>=1 && di<=3 && !numHasWorked;
-    const eligible = activeStaff.filter(s => {
-      if (!canWorkForFill(s, iso, shift)) return false;
-      if (overflowOnly && hw[s.id] >= periodTarget[s.id]) return false; // overflow only for hours-deficit
-      return true;
-    }).sort((a,b) => {
-      const aReq = !!(a.requests?.[`${iso}_${shift}`]);
-      const bReq = !!(b.requests?.[`${iso}_${shift}`]);
-      if (aReq && !bReq) return -1;
-      if (!aReq && bReq) return  1;
-      if (wknd) {
-        const dw = (wkndCnt[a.id]||0) - (wkndCnt[b.id]||0);
-        if (dw !== 0) return dw;
-      }
-      // Most hours remaining first
-      return (periodTarget[b.id]-hw[b.id]) - (periodTarget[a.id]-hw[a.id]);
-    });
-
-    for (const s of eligible) {
-      if (roster[iso][shift].length >= cap) return;
-      if (s.cls==="NUM") {
-        if (!isNUMSlot||numHasWorked) continue;
-      }
-      if (s.cls==="ANUM") {
-        const anumAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="ANUM");
-        if (anumAlready) continue;
-        const numAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="NUM");
-        if (numAlready) continue;
-      }
-      if (s.cls==="EN") {
-        const enAlready = roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="EN");
-        if (enAlready) continue;
-      }
-      if (s.cls==="GNP") {
-        const gnpCount = roster[iso][shift].filter(id=>activeStaff.find(x=>x.id===id)?.cls==="GNP").length;
-        if (gnpCount >= maxGNPShift) continue;
-      }
-
-      roster[iso][shift].push(s.id);
-      hw[s.id] += 8;
-      shiftCount[s.id]++;
-      if (wknd) wkndCnt[s.id] = (wkndCnt[s.id]||0)+1;
-      if (s.cls==="NUM") numHasWorked = true;
-      return; // filled one slot, exit
+  function classOk(s, iso, shift) {
+    if (s.cls==="NUM") {
+      const di=dayIdx(iso);
+      if (shift!=="D"||di<1||di>3||numHasWorked) return false;
     }
+    if (s.cls==="ANUM") {
+      if (roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="ANUM")) return false;
+      if (roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="NUM"))  return false;
+    }
+    if (s.cls==="EN") {
+      if (roster[iso][shift].some(id=>activeStaff.find(x=>x.id===id)?.cls==="EN")) return false;
+    }
+    if (s.cls==="GNP") {
+      const gc=roster[iso][shift].filter(id=>activeStaff.find(x=>x.id===id)?.cls==="GNP").length;
+      if (gc>=maxGNPShift) return false;
+    }
+    return true;
   }
 
-  // Ensure in-charge coverage after balanced fill
-  function ensureInCharge(iso, shift, wknd) {
-    const hasIC = roster[iso][shift].some(id=>{
-      const x=activeStaff.find(y=>y.id===id); return x&&isInCharge(x);
-    });
-    if (hasIC || roster[iso][shift].length===0) return;
-    const ic = activeStaff.find(s =>
-      !roster[iso][shift].includes(s.id) &&
-      isInCharge(s) &&
-      canWorkForFill(s, iso, shift)
+  function assignSlot(s, iso, shift, cap, wknd=false) {
+    if (!canWorkForFill(s,iso,shift)) return false;
+    if (!classOk(s,iso,shift)) return false;
+    if (roster[iso][shift].length >= cap) return false;
+    if (hw[s.id]+8 > periodTarget[s.id]) return false;
+    roster[iso][shift].push(s.id);
+    hw[s.id]+=8; shiftCount[s.id]++;
+    if (wknd) wkndCnt[s.id]=(wkndCnt[s.id]||0)+1;
+    if (s.cls==="NUM") numHasWorked=true;
+    return true;
+  }
+
+  function ensureIC(iso, shift, wknd=false) {
+    const hasIC=roster[iso][shift].some(id=>{const x=activeStaff.find(y=>y.id===id);return x&&isInCharge(x);});
+    if (hasIC||roster[iso][shift].length===0) return;
+    const ic=activeStaff.find(s=>
+      !roster[iso][shift].includes(s.id)&&isInCharge(s)&&
+      canWorkForFill(s,iso,shift)&&classOk(s,iso,shift)&&
+      hw[s.id]+8<=periodTarget[s.id]
     );
-    if (ic) {
-      roster[iso][shift].push(ic.id);
-      hw[ic.id] += 8;
-      shiftCount[ic.id]++;
-      if (wknd) wkndCnt[ic.id] = (wkndCnt[ic.id]||0)+1;
-    }
+    if (ic) { roster[iso][shift].push(ic.id); hw[ic.id]+=8; shiftCount[ic.id]++; if(wknd)wkndCnt[ic.id]=(wkndCnt[ic.id]||0)+1; }
   }
 
-  // Run shifts in priority order — weekends first, then Mon/Fri, then mid-week
-  orderedDays.forEach(({iso, di, wknd}) => {
-    fillDayBalanced(iso, di, wknd);
-    ensureInCharge(iso, "D", wknd);
-    ensureInCharge(iso, "E", wknd);
+  function bestCandidates(iso, shift, wknd, cap) {
+    return activeStaff
+      .filter(s=>canWorkForFill(s,iso,shift)&&classOk(s,iso,shift)&&roster[iso][shift].length<cap&&hw[s.id]+8<=periodTarget[s.id])
+      .sort((a,b)=>{
+        const aR=!!(a.requests?.[`${iso}_${shift}`]), bR=!!(b.requests?.[`${iso}_${shift}`]);
+        if(aR&&!bR)return -1; if(!aR&&bR)return 1;
+        if(wknd){const dw=(wkndCnt[a.id]||0)-(wkndCnt[b.id]||0);if(dw)return dw;}
+        return (periodTarget[b.id]-hw[b.id])-(periodTarget[a.id]-hw[a.id]);
+      });
+  }
+
+  function blockScore(sId, iso) {
+    const p1=isoDate(addDays(parseLocalDate(iso),-1));
+    const n1=isoDate(addDays(parseLocalDate(iso),1));
+    const p2=isoDate(addDays(parseLocalDate(iso),-2));
+    const n2=isoDate(addDays(parseLocalDate(iso),2));
+    const worked = k => roster[k]?.D.includes(sId)||roster[k]?.E.includes(sId)||roster[k]?.N.includes(sId)||prevTail[k]?.D?.includes(sId)||prevTail[k]?.E?.includes(sId);
+    let score=0;
+    if(worked(p1))score+=3; if(worked(n1))score+=3;
+    if(worked(p2))score+=1; if(worked(n2))score+=1;
+    return score;
+  }
+
+  const priorityDays = [...days.filter(d=>d.wknd), ...days.filter(d=>!d.wknd&&(d.di===0||d.di===4))];
+  const midWeekDays  = days.filter(d=>!d.wknd&&d.di!==0&&d.di!==4);
+
+  // ── PASS 1: Priority fill (weekends + Mon/Fri) ────────────
+  priorityDays.forEach(({iso, di, wknd}) => {
+    const BASE = wknd ? 9 : 10;
+    let round=0, stuck=0;
+    while ((roster[iso].D.length<BASE||roster[iso].E.length<BASE) && stuck<40) {
+      const sh=round%2===0?"D":"E"; round++;
+      if (roster[iso][sh].length>=BASE){stuck++;continue;}
+      const prev=roster[iso][sh].length;
+      const cand=bestCandidates(iso,sh,wknd,BASE)[0];
+      if(cand) assignSlot(cand,iso,sh,BASE,wknd);
+      if(roster[iso][sh].length===prev) stuck++; else stuck=0;
+    }
+    ensureIC(iso,"D",wknd); ensureIC(iso,"E",wknd);
   });
+
+  // ── PASS 2: Pre-allocate mid-week with block preference ───
+  // Calculate each person's remaining shifts needed
+  const midWeekNeed={};
+  deEligibleStaff.forEach(s=>{
+    midWeekNeed[s.id]=Math.floor(Math.max(0,periodTarget[s.id]-hw[s.id])/8);
+  });
+
+  // Sort staff: most constrained first (need / available days ratio)
+  const midWeekElig = deEligibleStaff
+    .filter(s=>(midWeekNeed[s.id]||0)>0)
+    .sort((a,b)=>{
+      const avA=midWeekDays.filter(d=>canWorkForFill(a,d.iso,"D")||canWorkForFill(a,d.iso,"E")).length||1;
+      const avB=midWeekDays.filter(d=>canWorkForFill(b,d.iso,"D")||canWorkForFill(b,d.iso,"E")).length||1;
+      return (midWeekNeed[b.id]/avB)-(midWeekNeed[a.id]/avA);
+    });
+
+  midWeekElig.forEach(s=>{
+    let needed=midWeekNeed[s.id]||0;
+    if(!needed)return;
+    // Score all available mid-week day+shift combos
+    const opts=[];
+    midWeekDays.forEach(({iso})=>{
+      ["D","E"].forEach(sh=>{
+        if(!canWorkForFill(s,iso,sh))return;
+        if(!classOk(s,iso,sh))return;
+        if(roster[iso][sh].length>=WEEKDAY_CEILING)return;
+        if(hw[s.id]+8>periodTarget[s.id])return;
+        // Prefer E slightly to balance with Pass 1 which fills D first on priority days
+        const shPref=sh==="E"?0.5:0;
+        opts.push({iso,sh,score:blockScore(s.id,iso)+shPref});
+      });
+    });
+    opts.sort((a,b)=>b.score-a.score);
+    let assigned=0;
+    for(const {iso,sh} of opts){
+      if(assigned>=needed)break;
+      if(assignSlot(s,iso,sh,WEEKDAY_CEILING,false)) assigned++;
+    }
+  });
+
+  // Top up mid-week shifts to BASE if under, then ensure IC
+  midWeekDays.forEach(({iso})=>{
+    ["D","E"].forEach(sh=>{
+      let stuck=0;
+      while(roster[iso][sh].length<10&&stuck<20){
+        const cand=bestCandidates(iso,sh,false,WEEKDAY_CEILING)[0];
+        if(!cand){stuck++;break;}
+        assignSlot(cand,iso,sh,WEEKDAY_CEILING,false);
+        stuck=0;
+      }
+      ensureIC(iso,sh,false);
+    });
+  });
+
+  // ── PASS 3: Refinement — fix isolated shifts ──────────────
+  for(let p=0;p<3;p++){
+    activeStaff.forEach(s=>{
+      if(s.permNights||(inNightPlanThisFn.has(s.id)&&!bumpedFromNights.has(s.id)))return;
+      days.forEach(({iso,wknd})=>{
+        if(!roster[iso].D.includes(s.id)&&!roster[iso].E.includes(s.id))return;
+        const p1=isoDate(addDays(parseLocalDate(iso),-1));
+        const n1=isoDate(addDays(parseLocalDate(iso),1));
+        const worked=k=>roster[k]?.D.includes(s.id)||roster[k]?.E.includes(s.id)||roster[k]?.N.includes(s.id)||leaveMap[s.id]?.[k];
+        if(worked(p1)||worked(n1))return; // not isolated
+        // Try to add adjacent day to fix isolation
+        const sh=roster[iso].D.includes(s.id)?"D":"E";
+        for(const fixIso of[p1,n1]){
+          if(!roster[fixIso])continue;
+          if(hw[s.id]+8>periodTarget[s.id])break;
+          const fixWknd=isWknd(fixIso);
+          const cap=fixWknd?9:WEEKDAY_CEILING;
+          for(const trySh of[sh,sh==="D"?"E":"D"]){
+            if(assignSlot(s,fixIso,trySh,cap,fixWknd)) break;
+          }
+          if(worked(fixIso))break;
+        }
+      });
+    });
+  }
 
   // Merge ADO into leaveMap for display
   activeStaff.forEach(s=>{ Object.keys(adoMap[s.id]).forEach(iso=>{ leaveMap[s.id][iso]="ADO"; }); });
@@ -909,7 +986,7 @@ function validateRosterConfig({ staff, startDate, weeks, nightPlanData }) {
     if (!s || s.archived) return false;
     if (s.resign) {
       const rosterEnd = addDays(startMon, weeks * 7 - 1);
-      if (new Date(s.resign) <= new Date(startDate)) return false;
+      if (parseLocalDate(s.resign) <= parseLocalDate(startDate)) return false;
     }
     return true;
   });
@@ -1152,7 +1229,7 @@ export default function App() {
     const r=rosters[lastLocked];
     const lastDay=r.days?.[r.days.length-1];
     if(!lastDay)return;
-    const nextMon=getMon(addDays(new Date(lastDay),1));
+    const nextMon=getMon(addDays(parseLocalDate(lastDay),1));
     setGenCfg(c=>({...c,startDate:isoDate(nextMon)}));
     toast(`Start date set to ${fmtDate(nextMon)} — Monday after the last locked roster`);
   }
@@ -1281,7 +1358,7 @@ export default function App() {
         {tab==="generate" &&<GenerateTab cfg={genCfg} setCfg={setGenCfg} onGenerate={handleGenerate} staff={staff} nightPlanData={nightPlanData} rosters={rosters} onSuggestDate={suggestNextStartDate}/>}
         {tab==="staff"    &&<StaffTab    staff={staff} setStaff={setStaff} toast={toast}/>}
         {tab==="leave"    &&<LeaveTab    staff={staff} setStaff={setStaff} toast={toast}/>}
-        {tab==="nightplan"&&<NightPlanTab staff={staff} nightPlanData={nightPlanData} setNightPlanData={setNightPlanData} toast={toast}/>}
+        {tab==="nightplan"&&<NightPlanTab staff={staff} nightPlanData={nightPlanData} setNightPlanData={setNightPlanData} toast={toast} rosters={rosters}/>}
         {tab==="ado"      &&<ADOTab      staff={staff} rosters={rosters} adoAdjustments={adoAdjustments} setAdoAdjustments={setAdoAdjustments} toast={toast}/>}
         {tab==="history"  &&<HistoryTab  rosters={rosters} staff={staff} activeKey={activeKey} setActiveKey={setActiveKey} setTab={setTab} onDelete={handleDeleteRoster}/>}
       </div>
@@ -1420,7 +1497,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
                   <th style={{...C.th,...C.fix1,minWidth:52}}>Cls</th>
                   <th style={{...C.th,...C.fix2,minWidth:64,borderRight:"2px solid #1a4070"}}>Hrs</th>
                   {days.map(iso=>{
-                    const dt=new Date(iso),di=dayIdx(iso),wknd=di>=5;
+                    const dt=parseLocalDate(iso),di=dayIdx(iso),wknd=di>=5;
                     return(
                       <th key={iso} style={{...C.th,minWidth:36,borderLeft:wknd?"2px solid #2a1030":"1px solid #1a3050",background:wknd?"#130a1a":"#080f1a",color:wknd?"#ce93d8":"#4a7fa0"}}>
                         <div style={{fontSize:8}}>{DAY_NAMES[di]}</div>
@@ -1520,7 +1597,7 @@ function RosterTab({roster,staff,rosterKeys,activeKey,setActiveKey,rosters,setRo
               <thead>
                 <tr>
                   <th style={{...C.th,minWidth:70,textAlign:"left",paddingLeft:10}}>Shift</th>
-                  {days.map(iso=>{const dt=new Date(iso),di=dayIdx(iso),wknd=di>=5;
+                  {days.map(iso=>{const dt=parseLocalDate(iso),di=dayIdx(iso),wknd=di>=5;
                     return<th key={iso} style={{...C.th,minWidth:36,fontSize:9,background:wknd?"#130a1a":"#080f1a",color:wknd?"#ce93d8":"#4a7fa0"}}>{DAY_NAMES[di]}<br/>{dt.getDate()}</th>;})}
                 </tr>
               </thead>
@@ -2345,9 +2422,10 @@ function LeaveTab({staff,setStaff,toast}){
 }
 
 // ─── NIGHT PLAN TAB ──────────────────────────────────────────
-function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
+function NightPlanTab({staff,nightPlanData,setNightPlanData,toast,rosters}){
   const [year,setYear]             = useState(new Date().getFullYear());
   const [view,setView]             = useState("planner");
+  const [monthOffset,setMonthOffset] = useState(new Date().getMonth());
   const [firstMonday,setFirstMonday] = useState(
     // Default: first Monday of current year, or stored from previous plan
     ()=> nightPlanData?.firstMonday || isoDate(getMon(new Date(new Date().getFullYear(),0,1)))
@@ -2357,7 +2435,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
   const gc=["#e53935","#fb8c00","#fdd835","#43a047","#1e88e5","#8e24aa","#00acc1","#f06292","#00897b","#6d4c41"];
 
   // Validate firstMonday is actually a Monday
-  const firstMondayValid = firstMonday && new Date(firstMonday).getDay() === 1;
+  const firstMondayValid = firstMonday && parseLocalDate(firstMonday).getDay() === 1;
 
   function autoGen(){
     if(!firstMondayValid){
@@ -2514,15 +2592,12 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
           )}
 
           {/* Bump History Ledger */}
-          {Object.keys(nightPlanData?.bumpHistory||rosters&&Object.values(rosters).reduce((acc,r)=>{
-            Object.entries(r.bumpHistory||{}).forEach(([k,v])=>{acc[k]=(acc[k]||0)+v;});
-            return acc;
-          },{})||{}).length>0&&(()=>{
-            const allBumps=Object.values(rosters).reduce((acc,r)=>{
+          {(()=>{
+            const allBumps = Object.values(rosters||{}).reduce((acc,r)=>{
               Object.entries(r.bumpHistory||{}).forEach(([k,v])=>{acc[k]=(acc[k]||0)+v;});
               return acc;
             },{});
-            if(!Object.keys(allBumps).length)return null;
+            if(!Object.keys(allBumps).length) return null;
             return(
               <>
                 <h3 style={{...C.sectionH,marginTop:24}}>Night Surplus — Bump History</h3>
@@ -2573,15 +2648,29 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
       )}
 
       {/* ── ANNUAL TIMELINE VIEW ── */}
-      {view==="timeline"&&(
+      {view==="timeline"&&(()=>{
+        const viewMonths=[0,1]; // show 2 months at a time for performance
+
+        return(
         <div>
           <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
             <div style={{display:"flex",gap:8,alignItems:"center",background:"#0a1828",borderRadius:8,border:"1px solid #1a3050",padding:"6px 12px"}}>
-              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y-1)}>‹</button>
+              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y-1)}>‹ Year</button>
               <strong style={{color:"#a8dadc",fontSize:16,minWidth:44,textAlign:"center"}}>{year}</strong>
-              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y+1)}>›</button>
+              <button style={C.weekNavBtn} onClick={()=>setYear(y=>y+1)}>Year ›</button>
+            </div>
+            <div style={{display:"flex",gap:8,alignItems:"center",background:"#0a1828",borderRadius:8,border:"1px solid #1a3050",padding:"6px 12px"}}>
+              <button style={C.weekNavBtn} onClick={()=>setMonthOffset(m=>Math.max(0,m-2))}>‹ Prev 2mo</button>
+              <strong style={{color:"#7fb3d3",fontSize:13,minWidth:120,textAlign:"center"}}>
+                {MONTH_NAMES[monthOffset%12]} – {MONTH_NAMES[(monthOffset+1)%12]}
+              </strong>
+              <button style={C.weekNavBtn} onClick={()=>setMonthOffset(m=>Math.min(10,m+2))}>Next 2mo ›</button>
             </div>
             {!nightPlanData&&<span style={{fontSize:11,color:"#ef5350"}}>⚠ No night plan generated — go to Planner tab first</span>}
+          </div>
+
+          <div style={{fontSize:10,color:"#2a6080",marginBottom:10}}>
+            Showing 2 months at a time for performance. Use Prev/Next to scroll through the year.
           </div>
 
           {/* Group colour legend */}
@@ -2605,36 +2694,44 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
             </div>
           )}
 
-          {/* Timeline grid — months across top, staff down the side */}
+          {/* Timeline grid — 2 months at a time, staff down the side */}
           {nightPlanData&&(()=>{
-            // Build a day-level map: iso -> groupId (or "perm" for perm nights)
+            // Build a day-level map only for the visible 2-month window
             const dayMap={};
-            yearFns.forEach(fn=>{
+            const windowStart=new Date(year,monthOffset,1);
+            const windowEnd=new Date(year,monthOffset+2,0); // last day of 2nd month
+            (nightPlanData.fns||[]).forEach(fn=>{
               const gid=nightPlanData.groupAssignments?.[fn.key];
               if(!gid)return;
+              const fnStart=parseLocalDate(typeof fn.start==="string"?fn.start.split("T")[0]:isoDate(fn.start));
               for(let d=0;d<14;d++){
-                const iso=isoDate(addDays(fn.start,d));
-                if(new Date(iso).getFullYear()===year) dayMap[iso]=gid;
+                const dt=addDays(fnStart,d);
+                if(dt>=windowStart&&dt<=windowEnd){
+                  dayMap[isoDate(dt)]=gid;
+                }
               }
             });
-            // Perm nights always show
-            permStaff.forEach(s=>{ /* handled by row rendering */ });
 
-            // All staff who appear in any night group or are perm nights
             const nightStaff=[
               ...permStaff,
               ...(nightPlanData.groups||[]).flatMap(g=>
                 staff.filter(s=>g.members.includes(s.id)&&!s.permNights)
               ),
-            ].filter((s,i,arr)=>arr.findIndex(x=>x.id===s.id)===i); // dedupe
+            ].filter((s,i,arr)=>arr.findIndex(x=>x.id===s.id)===i);
 
-            // Build month columns: Jan–Dec, each month = array of days in that month for this year
-            const months=Array.from({length:12},(_,m)=>{
+            // Build only the 2 visible months
+            const months=viewMonths.map(offset=>{
+              const m=monthOffset+offset;
               const days=[];
               let d=new Date(year,m,1);
-              while(d.getMonth()===m){ days.push(isoDate(d)); d=addDays(d,1); }
-              return {month:m,label:MONTH_NAMES[m],days};
+              const targetMonth=((m%12)+12)%12;
+              while(d.getMonth()===targetMonth){ days.push(isoDate(d)); d=addDays(d,1); }
+              return {month:targetMonth,label:MONTH_NAMES[targetMonth],days};
             });
+
+            if(nightStaff.length===0){
+              return <div style={{color:"#2a5070",fontSize:12,padding:16}}>No staff assigned to night groups yet.</div>;
+            }
 
             return(
               <div style={{overflowX:"auto"}}>
@@ -2646,22 +2743,21 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                         <th key={month} colSpan={days.length} style={{
                           ...C.th,background:"#060e18",color:"#4fc3f7",
                           borderLeft:"2px solid #1a3050",fontSize:11,padding:"6px 4px",
-                          minWidth:days.length*12,
+                          minWidth:days.length*14,
                         }}>{label}</th>
                       ))}
                     </tr>
-                    {/* Day numbers row */}
                     <tr>
                       <th style={{...C.th,position:"sticky",left:0,background:"#06101a",zIndex:4}}/>
                       {months.flatMap(({days})=>days.map(iso=>{
-                        const dt=new Date(iso); const di=dayIdx(iso); const wknd=di>=5;
+                        const dt=parseLocalDate(iso); const di=dayIdx(iso); const wknd=di>=5;
                         return(
                           <th key={iso} style={{
-                            ...C.th,minWidth:12,maxWidth:12,padding:"2px 0",fontSize:7,
+                            ...C.th,minWidth:14,maxWidth:14,padding:"2px 0",fontSize:8,
                             background:wknd?"#130a1a":"#080f1a",
                             color:wknd?"#3a1a50":"#2a5070",
                             borderLeft:dt.getDate()===1?"2px solid #1a3050":"none",
-                          }}>{dt.getDate()===1||dt.getDate()%5===0?dt.getDate():""}</th>
+                          }}>{dt.getDate()}</th>
                         );
                       }))}
                     </tr>
@@ -2669,7 +2765,6 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                   <tbody>
                     {nightStaff.map((s,ri)=>{
                       const cls=CLASSIFICATIONS[s.cls];
-                      // Find which group this staff belongs to
                       const staffGroup=nightPlanData.groups?.find(g=>g.members.includes(s.id));
                       const staffGroupColor=staffGroup?gc[staffGroup.id-1]||"#64b5f6":null;
 
@@ -2688,8 +2783,8 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                             </div>
                           </td>
                           {months.flatMap(({days})=>days.map(iso=>{
-                            const dt=new Date(iso);
-                            const isNightBlock = s.permNights || (nightPlanData.plan?.[s.id]?.[iso]);
+                            const dt=parseLocalDate(iso);
+                            const isNightBlock = s.permNights || !!(nightPlanData.plan?.[s.id]?.[iso]);
                             const gid=isNightBlock&&!s.permNights?dayMap[iso]:null;
                             const color=s.permNights?"#3949ab":(gid?gc[gid-1]||"#64b5f6":null);
                             const wknd=dayIdx(iso)>=5;
@@ -2697,9 +2792,9 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                               <td key={iso} style={{
                                 ...C.td,
                                 padding:0,
-                                minWidth:12,maxWidth:12,
+                                minWidth:14,maxWidth:14,
                                 background:isNightBlock
-                                  ?(color+"99"||"#1a237e99")
+                                  ?(color?color+"99":"#1a237e99")
                                   :wknd?"#0d0814":"transparent",
                                 borderLeft:dt.getDate()===1?"2px solid #1a3050":"none",
                                 borderBottom:"1px solid #0a1525",
@@ -2712,7 +2807,7 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
                   </tbody>
                 </table>
                 <div style={{fontSize:10,color:"#2a5070",marginTop:10}}>
-                  Each column = 1 day. Coloured blocks = night shifts assigned. Scroll horizontally to see the full year.
+                  Each column = 1 day. Coloured blocks = night shifts assigned.
                 </div>
               </div>
             );
@@ -2727,7 +2822,8 @@ function NightPlanTab({staff,nightPlanData,setNightPlanData,toast}){
             </div>
           )}
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
