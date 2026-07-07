@@ -1239,7 +1239,7 @@ export default function App() {
     const validation=validateRosterConfig({staff,startDate:genCfg.startDate,weeks:genCfg.weeks,nightPlanData});
     if(!validation.canGenerate){toast(`Cannot generate — ${validation.errors.length} blocking issue(s) must be fixed first`,"err");return;}
     try{
-      const key=`${isoDate(getMon(new Date(genCfg.startDate)))}_w${genCfg.weeks}`;
+      const key=`${isoDate(getMon(parseLocalDate(genCfg.startDate)))}_w${genCfg.weeks}`;
       if(rosters[key]?.locked){toast("That roster is locked. Unlock it first to regenerate.","err");return;}
       const sortedKeys=Object.keys(rosters).sort();
       const prevRoster=sortedKeys.length?rosters[sortedKeys[sortedKeys.length-1]]:null;
