@@ -250,8 +250,11 @@ const SAMPLE_STAFF = [
 
 // ─── ROSTER GENERATOR v3 ─────────────────────────────────────
 function generateRoster({staff,startDate,weeks,nightPlanData,previousRoster,recentWkndCounts,bumpHistory={}}) {
+  console.log("DIAG generateRoster received startDate:", startDate, "weeks:", weeks, typeof weeks);
   const startMon=getMon(parseLocalDate(startDate));
+  console.log("DIAG generateRoster startMon:", startMon.toString(), "iso:", isoDate(startMon), "day:", startMon.getDay());
   const days=buildDays(startMon,weeks);
+  console.log("DIAG generateRoster days.length:", days.length, "first:", days[0]?.iso, days[0]?.di, "last:", days[days.length-1]?.iso);
   const roster={};
   days.forEach(d=>{ roster[d.iso]={D:[],E:[],N:[]}; });
 
@@ -1239,6 +1242,11 @@ export default function App() {
     const validation=validateRosterConfig({staff,startDate:genCfg.startDate,weeks:genCfg.weeks,nightPlanData});
     if(!validation.canGenerate){toast(`Cannot generate — ${validation.errors.length} blocking issue(s) must be fixed first`,"err");return;}
     try{
+      // DIAGNOSTIC: verify date handling before generation
+      const diagStartMon = getMon(parseLocalDate(genCfg.startDate));
+      console.log("DIAG genCfg.startDate:", genCfg.startDate);
+      console.log("DIAG genCfg.weeks:", genCfg.weeks, typeof genCfg.weeks);
+      console.log("DIAG computed startMon:", diagStartMon.toString(), "iso:", isoDate(diagStartMon), "day:", diagStartMon.getDay());
       const key=`${isoDate(getMon(parseLocalDate(genCfg.startDate)))}_w${genCfg.weeks}`;
       if(rosters[key]?.locked){toast("That roster is locked. Unlock it first to regenerate.","err");return;}
       const sortedKeys=Object.keys(rosters).sort();
